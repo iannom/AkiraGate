@@ -332,6 +332,12 @@ function App() {
     setCurrent((previous) => mergeNodeResults(previous, nodeResults));
   }, []);
 
+  const handleBackgroundRefreshError = useCallback((error) => {
+    if (!handleAuthError(error)) {
+      setActionMsg(error.message || "后台刷新失败");
+    }
+  }, [handleAuthError]);
+
   const runAction = useCallback(
     async (name, pendingMessage, action, doneMessage) => {
       setBusyAction(name);
@@ -389,12 +395,12 @@ function App() {
       return undefined;
     }
     const timer = window.setInterval(() => {
-      loadState().catch(() => {});
-      loadLogs().catch(() => {});
-      loadGatewayStatus().catch(() => {});
+      loadState().catch(handleBackgroundRefreshError);
+      loadLogs().catch(handleBackgroundRefreshError);
+      loadGatewayStatus().catch(handleBackgroundRefreshError);
     }, 5000);
     return () => window.clearInterval(timer);
-  }, [loadGatewayStatus, loadLogs, loadState]);
+  }, [auth.authenticated, handleBackgroundRefreshError, loadGatewayStatus, loadLogs, loadState]);
 
   useEffect(() => {
     if (!auth.authenticated || (!isNodeTestAction(busyAction) && !batchTestActive)) {
@@ -870,7 +876,7 @@ function NodesPage({
   };
 
   const toggleNode = (nodeID) => {
-    if (batchActionActive) {
+    if (batchActionActive || !nodeID) {
       return;
     }
     setSelectedIDs((previous) =>
@@ -1307,15 +1313,18 @@ function NodeList({ nodes, selectedIDs, busyAction, batchTesting, onToggle, onTe
         <span>操作</span>
       </div>
       {nodes.map((node) => {
+        const nodeID = String(node.id || "");
+        const hasNodeID = Boolean(nodeID);
         const nodeTesting = node.probe_status === "testing";
+        const nodeActionDisabled = batchTesting || nodeTesting || !hasNodeID;
         return (
           <div className={`node-row ${nodeTesting ? "testing" : ""}`} key={node.id || `${node.remote_host}-${node.remote_port}`}>
             <label className="node-check">
               <input
                 type="checkbox"
-                checked={selectedIDs.includes(node.id)}
-                disabled={batchTesting}
-                onChange={() => onToggle(node.id)}
+                checked={hasNodeID && selectedIDs.includes(nodeID)}
+                disabled={batchTesting || !hasNodeID}
+                onChange={() => onToggle(nodeID)}
                 aria-label={`选择节点 ${node.id || node.remote_host || ""}`}
               />
             </label>
@@ -1328,8 +1337,8 @@ function NodeList({ nodes, selectedIDs, busyAction, batchTesting, onToggle, onTe
             <div className="node-cell muted">{formatProbeStatus(node)}</div>
             <ExitTestInfo node={node} />
             <div className="row-actions">
-              <ActionButton icon={Zap} label={nodeTesting ? "测试中" : "测试"} compact busy={busyAction === `test-${node.id}` || nodeTesting} disabled={batchTesting || nodeTesting} onClick={() => onTest(node.id)} />
-              <ActionButton icon={Play} label="连接" compact busy={busyAction === `connect-${node.id}`} disabled={batchTesting} onClick={() => onConnect(node.id)} />
+              <ActionButton icon={Zap} label={nodeTesting ? "测试中" : "测试"} compact busy={busyAction === `test-${nodeID}` || nodeTesting} disabled={nodeActionDisabled} onClick={() => onTest(nodeID)} />
+              <ActionButton icon={Play} label="连接" compact busy={busyAction === `connect-${nodeID}`} disabled={batchTesting || !hasNodeID} onClick={() => onConnect(nodeID)} />
             </div>
           </div>
         );

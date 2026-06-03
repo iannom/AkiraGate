@@ -126,11 +126,23 @@ type ListenerBackendState struct {
 
 type ProxyTestResult struct {
 	OK        bool            `json:"ok"`
+	Listener  string          `json:"listener,omitempty"`
+	Listen    string          `json:"listen,omitempty"`
 	IP        string          `json:"ip,omitempty"`
 	LatencyMS int             `json:"latency_ms,omitempty"`
 	Error     string          `json:"error,omitempty"`
 	ProxyURL  string          `json:"proxy_url,omitempty"`
 	Info      *vpngate.IPInfo `json:"info,omitempty"`
+}
+
+type ProxyTestResponse struct {
+	OK        bool              `json:"ok"`
+	IP        string            `json:"ip,omitempty"`
+	LatencyMS int               `json:"latency_ms,omitempty"`
+	Error     string            `json:"error,omitempty"`
+	ProxyURL  string            `json:"proxy_url,omitempty"`
+	Info      *vpngate.IPInfo   `json:"info,omitempty"`
+	Results   []ProxyTestResult `json:"results,omitempty"`
 }
 
 type LoginRequest struct {
@@ -346,6 +358,16 @@ func (s *Server) gatewayStatus(w http.ResponseWriter) {
 	nodesCount := len(s.nodes)
 	listenHost := s.listenHost
 	listenPort := s.listenPort
+	sessionStatus := ""
+	sessionMessage := ""
+	var backends []ListenerBackendState
+	var socksURLs []string
+	if session != nil {
+		sessionStatus = session.status
+		sessionMessage = session.message
+		backends = listenerBackendStates(session.listenerBackends)
+		socksURLs = append([]string(nil), session.socksURLs...)
+	}
 	s.mu.Unlock()
 
 	webStatus := "running"
@@ -360,9 +382,8 @@ func (s *Server) gatewayStatus(w http.ResponseWriter) {
 	proxyStatus := "stopped"
 	proxyDetails := "SOCKS5 网关未启动"
 	if session != nil {
-		vpnStatus = session.status
-		vpnDetails = session.message
-		backends := listenerBackendStates(session.listenerBackends)
+		vpnStatus = sessionStatus
+		vpnDetails = sessionMessage
 		if len(backends) > 0 {
 			var details []string
 			for _, backend := range backends {
@@ -381,11 +402,11 @@ func (s *Server) gatewayStatus(w http.ResponseWriter) {
 				}
 				details = append(details, item)
 			}
-			proxyStatus = "running"
+			proxyStatus = aggregateBackendStatus(backends)
 			proxyDetails = strings.Join(details, "\n")
-		} else if len(session.socksURLs) > 0 {
+		} else if len(socksURLs) > 0 {
 			proxyStatus = "starting"
-			proxyDetails = strings.Join(session.socksURLs, "\n")
+			proxyDetails = strings.Join(socksURLs, "\n")
 		}
 	}
 
@@ -403,18 +424,18 @@ func (s *Server) gatewayStatus(w http.ResponseWriter) {
 func (s *Server) testProxy(w http.ResponseWriter) {
 	s.mu.Lock()
 	session := s.session
-	var proxyURL string
-	if session != nil && len(session.socksURLs) > 0 {
-		proxyURL = session.socksURLs[0]
+	backends := []ListenerBackendState{}
+	if session != nil {
+		backends = listenerBackendStates(session.listenerBackends)
 	}
 	s.mu.Unlock()
 
-	result := checkProxy(proxyURL)
+	response := testListenerProxies(backends)
 	status := http.StatusOK
-	if !result.OK {
+	if !response.OK {
 		status = http.StatusBadGateway
 	}
-	s.sendJSONWithStatus(w, status, result)
+	s.sendJSONWithStatus(w, status, response)
 }
 
 func (s *Server) configSnapshot() Config {
@@ -658,6 +679,57 @@ func listenerBackendStates(backends map[string]ListenerBackendState) []ListenerB
 	return values
 }
 
+func aggregateBackendStatus(backends []ListenerBackendState) string {
+	if len(backends) == 0 {
+		return "starting"
+	}
+	running := 0
+	errorsCount := 0
+	switching := 0
+	for _, backend := range backends {
+		switch backend.Status {
+		case "running":
+			running++
+		case "error":
+			errorsCount++
+		case "switching":
+			switching++
+		}
+	}
+	if running == len(backends) {
+		return "running"
+	}
+	if errorsCount == len(backends) {
+		return "error"
+	}
+	if switching > 0 || errorsCount > 0 {
+		return "switching"
+	}
+	return "starting"
+}
+
+func aggregateBackendMessage(backends []ListenerBackendState) string {
+	if len(backends) == 0 {
+		return "正在为每个 SOCKS5 入口启动独立 OpenVPN 后端"
+	}
+	running := 0
+	for _, backend := range backends {
+		if backend.Status == "running" {
+			running++
+		}
+	}
+	switch aggregateBackendStatus(backends) {
+	case "running":
+		return "每个 SOCKS5 入口均已绑定独立 OpenVPN 后端"
+	case "error":
+		return "所有 SOCKS5 入口的 OpenVPN 后端均不可用"
+	case "switching":
+		return fmt.Sprintf("SOCKS5 入口后端正在切换，已运行 %d/%d", running, len(backends))
+	default:
+		return fmt.Sprintf("SOCKS5 入口后端正在启动，已运行 %d/%d", running, len(backends))
+	}
+}
+
 func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 	var next Config
 	if err := json.NewDecoder(r.Body).Decode(&next); err != nil {
@@ -735,9 +807,9 @@ func (s *Server) connect(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		if config.OpenVPNConfig == "" {
-			if len(s.nodes) == 0 {
+			if !hasListenerBackendPolicy(config.SocksListeners) {
 				s.mu.Unlock()
-				s.sendError(w, http.StatusBadRequest, "请先设置 OpenVPN 配置文件路径、选择节点或刷新 VPNGate 节点")
+				s.sendError(w, http.StatusBadRequest, "请先设置 OpenVPN 配置文件路径、选择节点或配置 SOCKS5 入口绑定策略")
 				return
 			}
 		} else if _, err := os.Stat(config.OpenVPNConfig); err != nil {
@@ -1195,6 +1267,10 @@ func (s *Server) runSession(ctx context.Context, session *Session) {
 		go s.runListenerWorker(ctx, session, listener, resultCh)
 	}
 
+	s.consumeListenerResults(ctx, session, resultCh)
+}
+
+func (s *Server) consumeListenerResults(ctx context.Context, session *Session, resultCh <-chan listenerWorkerResult) {
 	for {
 		select {
 		case <-ctx.Done():
@@ -1202,6 +1278,7 @@ func (s *Server) runSession(ctx context.Context, session *Session) {
 			return
 		case result := <-resultCh:
 			if result.Err != nil && ctx.Err() == nil {
+				session.cancel()
 				s.finishSession(session, "error", fmt.Sprintf("SOCKS5 入口 %s 异常退出: %v", result.Listener.Name, result.Err))
 				return
 			}
@@ -1365,6 +1442,7 @@ func (s *Server) serveListenerBackend(ctx context.Context, session *Session, lis
 		_ = tunnel.Close()
 		return fmt.Errorf("初始化用户态 TCP/IP 栈失败: %w", err)
 	}
+	// Dialer.Close 会关闭底层 tunnel，避免重复关闭。
 	defer dialer.Close()
 
 	server := socks.NewServer(
@@ -1401,7 +1479,6 @@ func (s *Server) serveListenerBackend(ctx context.Context, session *Session, lis
 		EntryIP:     plan.EntryIP,
 		ProxyURL:    proxyURL,
 	})
-	s.updateSession(session, "running", "每个 SOCKS5 入口均已绑定独立 OpenVPN 后端")
 
 	ticker := time.NewTicker(healthCheckInterval)
 	defer ticker.Stop()
@@ -1484,6 +1561,9 @@ func (s *Server) updateListenerBackendState(session *Session, listener gatewayco
 	state.Error = update.Error
 	session.listenerBackends[key] = state
 	s.recomputeActiveNodesLocked(session)
+	backends := listenerBackendStates(session.listenerBackends)
+	session.status = aggregateBackendStatus(backends)
+	session.message = aggregateBackendMessage(backends)
 }
 
 func (s *Server) recomputeActiveNodesLocked(session *Session) {
@@ -1861,6 +1941,7 @@ func checkProxy(proxyURL string) ProxyTestResult {
 	transport := &http.Transport{
 		Proxy: http.ProxyURL(parsed),
 	}
+	defer transport.CloseIdleConnections()
 	client := &http.Client{
 		Transport: transport,
 		Timeout:   10 * time.Second,
@@ -1873,12 +1954,78 @@ func checkProxy(proxyURL string) ProxyTestResult {
 	return ProxyTestResult{OK: true, IP: info.IP, LatencyMS: int(time.Since(started).Milliseconds()), ProxyURL: proxyURL, Info: info}
 }
 
+func testListenerProxies(backends []ListenerBackendState) ProxyTestResponse {
+	if len(backends) == 0 {
+		result := checkProxy("")
+		return proxyTestResponseFromResult(result, nil)
+	}
+	results := make([]ProxyTestResult, 0, len(backends))
+	allOK := true
+	for _, backend := range backends {
+		result := ProxyTestResult{
+			Listener: backend.ListenerName,
+			Listen:   backend.ListenAddress,
+			ProxyURL: backend.ProxyURL,
+		}
+		if backend.Status != "running" {
+			result.OK = false
+			result.Error = fmt.Sprintf("SOCKS5 入口未运行: %s", backend.Status)
+		} else {
+			proxyResult := checkProxy(backend.ProxyURL)
+			result.OK = proxyResult.OK
+			result.IP = proxyResult.IP
+			result.LatencyMS = proxyResult.LatencyMS
+			result.Error = proxyResult.Error
+			result.Info = proxyResult.Info
+			if result.ProxyURL == "" {
+				result.ProxyURL = proxyResult.ProxyURL
+			}
+		}
+		if !result.OK {
+			allOK = false
+		}
+		results = append(results, result)
+	}
+	response := proxyTestResponseFromResult(results[0], results)
+	response.OK = allOK
+	if !allOK {
+		response.Error = proxyTestSummaryError(results)
+	}
+	return response
+}
+
+func proxyTestResponseFromResult(result ProxyTestResult, results []ProxyTestResult) ProxyTestResponse {
+	return ProxyTestResponse{
+		OK:        result.OK,
+		IP:        result.IP,
+		LatencyMS: result.LatencyMS,
+		Error:     result.Error,
+		ProxyURL:  result.ProxyURL,
+		Info:      result.Info,
+		Results:   results,
+	}
+}
+
+func proxyTestSummaryError(results []ProxyTestResult) string {
+	if len(results) == 0 {
+		return "SOCKS5 网关未启动"
+	}
+	failed := 0
+	for _, result := range results {
+		if !result.OK {
+			failed++
+		}
+	}
+	return fmt.Sprintf("%d/%d 个 SOCKS5 入口出口检测失败", failed, len(results))
+}
+
 func (s *Server) checkTunnelExit(ctx context.Context, tunnel *vpn.Tunnel, nodeID string) (*vpngate.IPInfo, error) {
 	dialer, err := vpn.NewDialer(ctx, tunnel, s.logger.With("probe_node", nodeID))
 	if err != nil {
 		_ = tunnel.Close()
 		return nil, fmt.Errorf("初始化用户态 TCP/IP 栈失败: %w", err)
 	}
+	// Dialer.Close 会关闭底层 tunnel，避免重复关闭。
 	defer dialer.Close()
 
 	proxyCtx, cancel := context.WithCancel(ctx)

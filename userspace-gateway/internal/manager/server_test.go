@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	gatewayconfig "akiragate/userspace-gateway/internal/config"
 	"akiragate/userspace-gateway/internal/vpngate"
@@ -212,6 +214,86 @@ func TestGatewayStatusAPI(t *testing.T) {
 	}
 }
 
+func TestGatewayStatusDoesNotReportProxyRunningBeforeAllBackendsRun(t *testing.T) {
+	server := testServer(t)
+	server.listenHost = "127.0.0.1"
+	server.listenPort = 8787
+	config := testConfig()
+	config.SocksListeners = []gatewayconfig.Listener{
+		gatewayconfig.NewListener("socks-a", "127.0.0.1", 7928, true),
+		gatewayconfig.NewListener("socks-b", "127.0.0.1", 7929, true),
+	}
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server.session = &Session{
+		startedAt: time.Now(),
+		config:    config,
+		cancel:    cancel,
+		status:    "starting",
+		message:   "正在启动",
+		listenerBackends: map[string]ListenerBackendState{
+			"127.0.0.1:7928": {ListenerName: "socks-a", ListenAddress: "127.0.0.1:7928", Status: "running", ProxyURL: "socks5h://127.0.0.1:7928"},
+			"127.0.0.1:7929": {ListenerName: "socks-b", ListenAddress: "127.0.0.1:7929", Status: "switching", Error: "健康检查失败"},
+		},
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/secret/api/gateway_status", nil)
+	addLoginCookie(t, server, req)
+	rec := httptest.NewRecorder()
+
+	server.route(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("网关状态接口请求失败: %d", rec.Code)
+	}
+	var payload struct {
+		Components []GatewayComponent `json:"components"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("网关状态响应不是有效 JSON: %v", err)
+	}
+	var proxyComponent GatewayComponent
+	for _, component := range payload.Components {
+		if component.Name == "SOCKS5 网关" {
+			proxyComponent = component
+			break
+		}
+	}
+	if proxyComponent.Status != "switching" {
+		t.Fatalf("部分后端未运行时 SOCKS5 网关不应显示 running，实际: %+v", proxyComponent)
+	}
+}
+
+func TestListenerBackendUpdatesAggregateSessionStatus(t *testing.T) {
+	server := testServer(t)
+	config := testConfig()
+	listenerA := gatewayconfig.NewListener("socks-a", "127.0.0.1", 7928, true)
+	listenerB := gatewayconfig.NewListener("socks-b", "127.0.0.1", 7929, true)
+	config.SocksListeners = []gatewayconfig.Listener{listenerA, listenerB}
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	session := &Session{
+		startedAt:        time.Now(),
+		config:           config,
+		cancel:           cancel,
+		status:           "starting",
+		message:          "正在启动",
+		listenerBackends: map[string]ListenerBackendState{},
+	}
+	server.session = session
+
+	server.updateListenerBackendState(session, listenerA, ListenerBackendState{Status: "running", ProxyURL: "socks5h://127.0.0.1:7928"})
+	server.updateListenerBackendState(session, listenerB, ListenerBackendState{Status: "switching", Error: "健康检查失败"})
+	if session.status == "running" {
+		t.Fatalf("只有部分入口运行时，会话不应显示 running: status=%s message=%s", session.status, session.message)
+	}
+
+	server.updateListenerBackendState(session, listenerB, ListenerBackendState{Status: "running", ProxyURL: "socks5h://127.0.0.1:7929"})
+	if session.status != "running" {
+		t.Fatalf("所有入口运行后，会话应显示 running: status=%s message=%s", session.status, session.message)
+	}
+}
+
 func TestRouteServesReactFrontendFiles(t *testing.T) {
 	server := testServer(t)
 	webRoot := t.TempDir()
@@ -267,6 +349,79 @@ func TestTestProxyRejectsWhenGatewayIsStopped(t *testing.T) {
 	}
 	if payload.OK || payload.Error == "" {
 		t.Fatalf("出口检测失败响应不符合预期: %+v", payload)
+	}
+}
+
+func TestTestProxyReturnsPerListenerResults(t *testing.T) {
+	server := testServer(t)
+	config := testConfig()
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server.session = &Session{
+		startedAt: time.Now(),
+		config:    config,
+		cancel:    cancel,
+		status:    "switching",
+		message:   "正在切换",
+		listenerBackends: map[string]ListenerBackendState{
+			"127.0.0.1:7928": {
+				ListenerName:  "socks-a",
+				ListenAddress: "127.0.0.1:7928",
+				Status:        "switching",
+				ProxyURL:      "socks5h://127.0.0.1:7928",
+			},
+			"127.0.0.1:7929": {
+				ListenerName:  "socks-b",
+				ListenAddress: "127.0.0.1:7929",
+				Status:        "error",
+				ProxyURL:      "socks5h://127.0.0.1:7929",
+			},
+		},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/secret/api/test_proxy", nil)
+	addLoginCookie(t, server, req)
+	rec := httptest.NewRecorder()
+
+	server.route(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("入口未全部运行时出口检测应失败，实际: %d", rec.Code)
+	}
+	var payload ProxyTestResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("出口检测响应不是有效 JSON: %v", err)
+	}
+	if payload.OK {
+		t.Fatal("入口未全部运行时出口检测不应成功")
+	}
+	if len(payload.Results) != 2 {
+		t.Fatalf("出口检测应返回每个监听入口结果，实际: %d", len(payload.Results))
+	}
+	for _, result := range payload.Results {
+		if result.Listener == "" || result.Listen == "" || result.Error == "" {
+			t.Fatalf("入口检测失败结果应包含入口信息和错误: %+v", result)
+		}
+	}
+}
+
+func TestConnectRejectsVPNGateNodesWithoutOpenVPNOrListenerPolicy(t *testing.T) {
+	server := testServer(t)
+	server.config.OpenVPNConfig = ""
+	server.nodes = []vpngate.Node{{
+		ID:         "jp-1",
+		ConfigText: "client\nremote 203.0.113.10 1194\n",
+	}}
+	req := httptest.NewRequest(http.MethodPost, "/secret/api/connect", nil)
+	addLoginCookie(t, server, req)
+	rec := httptest.NewRecorder()
+
+	server.route(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("无 OpenVPN 配置且无入口绑定策略时手动连接应失败，实际: %d", rec.Code)
+	}
+	if server.session != nil {
+		t.Fatal("手动连接失败后不应创建会话")
 	}
 }
 
@@ -508,6 +663,36 @@ func TestTryAutoConnectSkipsVPNGateNodesWithoutConfiguredOpenVPN(t *testing.T) {
 
 	if server.session != nil {
 		t.Fatal("没有监听器绑定策略时，启动自动连接不应使用 VPNGate 节点生成临时 OpenVPN 配置")
+	}
+}
+
+func TestRunSessionCancelsOtherWorkersOnListenerError(t *testing.T) {
+	server := testServer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelled := false
+	session := &Session{
+		startedAt: time.Now(),
+		cancel: func() {
+			cancelled = true
+			cancel()
+		},
+		listenerBackends: map[string]ListenerBackendState{},
+	}
+	server.session = session
+	resultCh := make(chan listenerWorkerResult, 1)
+	resultCh <- listenerWorkerResult{
+		Listener: gatewayconfig.NewListener("local", "127.0.0.1", 7928, true),
+		Err:      errors.New("监听失败"),
+	}
+
+	server.consumeListenerResults(ctx, session, resultCh)
+
+	if !cancelled {
+		t.Fatal("任一 SOCKS5 入口失败时应取消会话上下文以清理其它后端")
+	}
+	if server.session != nil {
+		t.Fatal("入口失败后会话应结束")
 	}
 }
 
