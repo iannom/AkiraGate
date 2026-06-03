@@ -327,7 +327,7 @@ install_ml() {
 set -euo pipefail
 
 CONFIG_FILE="${AKIRAGATE_CONFIG:-/opt/akiragate/akiragate_data/config.json}"
-INSTALL_DIR="/opt/akiragate"
+INSTALL_DIR="${AKIRAGATE_INSTALL_DIR:-/opt/akiragate}"
 
 json_value() {
     key="$1"
@@ -363,6 +363,133 @@ logs_cmd() {
     journalctl -u akiragate.service -f -n 80
 }
 
+reset_password_cmd() {
+    if [ -n "${1:-}" ]; then
+        echo "为避免命令历史泄露，不支持通过参数传入密码。请直接运行 ml reset-password 后输入新密码。" >&2
+        exit 1
+    fi
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "配置文件不存在: $CONFIG_FILE" >&2
+        exit 1
+    fi
+    printf "请输入新的管理密码: "
+    if [ -t 0 ]; then
+        trap 'stty echo 2>/dev/null || true' EXIT
+        stty -echo
+        read -r new_password
+        stty echo
+        trap - EXIT
+    else
+        read -r new_password
+    fi
+    printf "\n"
+    printf "请再次输入新的管理密码: "
+    if [ -t 0 ]; then
+        trap 'stty echo 2>/dev/null || true' EXIT
+        stty -echo
+        read -r confirm_password
+        stty echo
+        trap - EXIT
+    else
+        read -r confirm_password
+    fi
+    printf "\n"
+    if [ "$new_password" != "$confirm_password" ]; then
+        echo "两次输入的密码不一致。" >&2
+        exit 1
+    fi
+    if [ "${#new_password}" -lt 8 ]; then
+        echo "管理密码长度至少需要 8 位。" >&2
+        exit 1
+    fi
+    if ! command -v node >/dev/null 2>&1; then
+        echo "找不到 node，无法安全更新 JSON 配置。请先重新运行安装脚本补齐依赖。" >&2
+        exit 1
+    fi
+    if ! command -v go >/dev/null 2>&1; then
+        echo "找不到 go，无法生成安全的密码哈希。请先重新运行安装脚本补齐依赖。" >&2
+        exit 1
+    fi
+    if [ ! -d "${INSTALL_DIR}/userspace-gateway" ]; then
+        echo "找不到后端源码目录: ${INSTALL_DIR}/userspace-gateway" >&2
+        exit 1
+    fi
+
+    hash_tmp="$(mktemp -d)"
+    cat > "${hash_tmp}/hash_password.go" <<'GOEOF'
+package main
+
+import (
+	"fmt"
+	"io"
+	"os"
+	"strings"
+
+	"golang.org/x/crypto/bcrypt"
+)
+
+func main() {
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		panic(err)
+	}
+	password := strings.TrimRight(string(data), "\r\n")
+	if password == "" {
+		panic("密码不能为空")
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	if err != nil {
+		panic(err)
+	}
+	fmt.Println(string(hash))
+}
+GOEOF
+    if ! password_hash="$(printf '%s' "$new_password" | (cd "${INSTALL_DIR}/userspace-gateway" && go run "${hash_tmp}/hash_password.go"))"; then
+        rm -rf "$hash_tmp"
+        echo "生成管理密码哈希失败。" >&2
+        exit 1
+    fi
+    rm -rf "$hash_tmp"
+    if [ -z "$password_hash" ]; then
+        echo "生成管理密码哈希失败。" >&2
+        exit 1
+    fi
+
+    backup="${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+    cp -p "$CONFIG_FILE" "$backup"
+    export CONFIG_FILE NEW_ADMIN_PASSWORD_HASH="$password_hash"
+    if ! node <<'NODE'
+const fs = require("fs");
+const path = process.env.CONFIG_FILE;
+const passwordHash = process.env.NEW_ADMIN_PASSWORD_HASH;
+if (!path || !passwordHash) {
+  throw new Error("缺少配置路径或密码哈希");
+}
+const raw = fs.readFileSync(path, "utf8");
+const config = JSON.parse(raw);
+config.admin_password_hash = passwordHash;
+delete config.admin_password;
+const tempPath = `${path}.tmp.${process.pid}`;
+fs.writeFileSync(tempPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+fs.renameSync(tempPath, path);
+NODE
+    then
+        cp -p "$backup" "$CONFIG_FILE"
+        unset NEW_ADMIN_PASSWORD_HASH
+        echo "更新配置失败，已恢复备份配置。" >&2
+        exit 1
+    fi
+    chmod 600 "$CONFIG_FILE"
+    unset NEW_ADMIN_PASSWORD_HASH
+    if ! service_cmd restart; then
+        cp -p "$backup" "$CONFIG_FILE"
+        service_cmd restart >/dev/null 2>&1 || true
+        echo "服务重启失败，已恢复备份配置。备份文件: $backup" >&2
+        exit 1
+    fi
+    echo "管理密码已重置。配置备份: $backup"
+}
+
 update_cmd() {
     cd "$INSTALL_DIR"
     git pull || true
@@ -383,9 +510,10 @@ case "${1:-status}" in
     start|stop|restart) service_cmd "$1" ;;
     status) status_cmd ;;
     logs) logs_cmd ;;
+    reset-password) shift; reset_password_cmd "$@" ;;
     update) update_cmd ;;
     uninstall) uninstall_cmd ;;
-    *) echo "可用命令: ml status|start|stop|restart|logs|update|uninstall" ;;
+    *) echo "可用命令: ml status|start|stop|restart|logs|reset-password|update|uninstall" ;;
 esac
 EOF
     chmod +x /usr/bin/ml

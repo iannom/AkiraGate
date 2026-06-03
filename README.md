@@ -102,6 +102,7 @@ ml logs
 ml restart
 ml stop
 ml start
+ml reset-password
 ml uninstall
 ```
 
