@@ -31,8 +31,21 @@ const (
 	sessionCookieName    = "aimili_session"
 	defaultIPPureInfoURL = "https://my.ippure.com/v1/info"
 	maxBatchNodeTests    = 8
+	maxBatchTestWorkers  = 3
 	exitInfoRequestLimit = 16 * 1024
 )
+
+type nodeTestJob struct {
+	Index  int
+	NodeID string
+}
+
+type nodeTestResult struct {
+	Index  int
+	NodeID string
+	Node   vpngate.Node
+	Err    error
+}
 
 type Server struct {
 	configPath string
@@ -756,16 +769,47 @@ func (s *Server) testNodes(w http.ResponseWriter, r *http.Request) {
 	if len(nodeIDs) > maxBatchNodeTests {
 		nodeIDs = nodeIDs[:maxBatchNodeTests]
 	}
-	results := make([]vpngate.Node, 0, len(nodeIDs))
-	for _, nodeID := range nodeIDs {
-		node, err := s.probeNode(nodeID)
-		if err != nil {
-			s.logger.Warn("节点测试失败", "node", nodeID, "error", err)
-			continue
-		}
-		results = append(results, node)
-	}
+	results := s.probeNodesConcurrently(nodeIDs)
 	s.sendJSON(w, map[string]any{"ok": true, "nodes": results})
+}
+
+func (s *Server) probeNodesConcurrently(nodeIDs []string) []vpngate.Node {
+	if len(nodeIDs) == 0 {
+		return []vpngate.Node{}
+	}
+	workerCount := maxBatchTestWorkers
+	if workerCount > len(nodeIDs) {
+		workerCount = len(nodeIDs)
+	}
+	jobs := make(chan nodeTestJob)
+	resultCh := make(chan nodeTestResult, len(nodeIDs))
+
+	for worker := 0; worker < workerCount; worker++ {
+		go func() {
+			for job := range jobs {
+				node, err := s.probeNode(job.NodeID)
+				resultCh <- nodeTestResult{Index: job.Index, NodeID: job.NodeID, Node: node, Err: err}
+			}
+		}()
+	}
+
+	go func() {
+		for idx, nodeID := range nodeIDs {
+			jobs <- nodeTestJob{Index: idx, NodeID: nodeID}
+		}
+		close(jobs)
+	}()
+
+	results := make([]vpngate.Node, len(nodeIDs))
+	for range nodeIDs {
+		result := <-resultCh
+		if result.Err != nil {
+			s.logger.Warn("节点测试失败", "node", result.NodeID, "error", result.Err)
+			result.Node = s.markNodeProbeFailed(result.NodeID, result.Err.Error())
+		}
+		results[result.Index] = result.Node
+	}
+	return results
 }
 
 func (s *Server) probeNode(nodeID string) (vpngate.Node, error) {
@@ -821,6 +865,26 @@ func (s *Server) probeNode(nodeID string) (vpngate.Node, error) {
 		}
 	}
 	return vpngate.Node{}, errors.New("节点不存在")
+}
+
+func (s *Server) markNodeProbeFailed(nodeID string, message string) vpngate.Node {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for idx := range s.nodes {
+		if s.nodes[idx].ID == nodeID {
+			s.nodes[idx].ProbeStatus = "unavailable"
+			s.nodes[idx].ProbeMessage = message
+			s.nodes[idx].ExitIPInfo = nil
+			s.failed[nodeID] = message
+			return s.nodes[idx]
+		}
+	}
+	s.failed[nodeID] = message
+	return vpngate.Node{
+		ID:           nodeID,
+		ProbeStatus:  "unavailable",
+		ProbeMessage: message,
+	}
 }
 
 func (s *Server) disconnect(w http.ResponseWriter) {

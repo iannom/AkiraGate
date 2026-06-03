@@ -334,6 +334,21 @@ func TestTestNodesWithEmptyList(t *testing.T) {
 	}
 }
 
+func TestProbeNodesConcurrentlyReturnsFailedNodes(t *testing.T) {
+	server := testServer(t)
+
+	nodes := server.probeNodesConcurrently([]string{"missing-a", "missing-b"})
+
+	if len(nodes) != 2 {
+		t.Fatalf("批量测试应返回所有节点结果，实际: %d", len(nodes))
+	}
+	for _, node := range nodes {
+		if node.ProbeStatus != "unavailable" || node.ProbeMessage == "" {
+			t.Fatalf("失败节点应返回 unavailable 和错误信息: %+v", node)
+		}
+	}
+}
+
 func TestLocalProxyURLsEscapesCredentials(t *testing.T) {
 	listener := gatewayconfig.NewListener("local", "127.0.0.1", 7928, true)
 	listener.Username = "proxy user"

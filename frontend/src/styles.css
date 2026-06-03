@@ -128,7 +128,7 @@ h2 {
 }
 
 .shell {
-  width: min(1200px, 100%);
+  width: min(1480px, 100%);
   margin: 0 auto;
   padding: 28px 18px 48px;
 }
@@ -220,6 +220,10 @@ h2 {
   margin-bottom: 16px;
 }
 
+.nodes-panel {
+  padding: 18px;
+}
+
 .section-title,
 .panel-head,
 .listener-head,
@@ -281,9 +285,9 @@ h2 {
 
 .node-toolbar {
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) minmax(160px, 220px) minmax(150px, 190px);
-  gap: 10px;
-  margin-bottom: 12px;
+  grid-template-columns: minmax(420px, 1fr) minmax(190px, 240px) minmax(170px, 220px);
+  gap: 12px;
+  margin-bottom: 14px;
 }
 
 .search-field {
@@ -375,7 +379,8 @@ h2 {
 }
 
 .list-scroll {
-  max-height: 320px;
+  max-height: min(76vh, 860px);
+  min-height: 560px;
   overflow: auto;
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -384,10 +389,11 @@ h2 {
 
 .node-row {
   display: grid;
-  grid-template-columns: 26px minmax(0, 1fr) auto;
+  grid-template-columns: 30px minmax(760px, 1fr) auto;
   align-items: center;
-  gap: 12px;
-  padding: 10px 12px;
+  gap: 16px;
+  min-width: 1120px;
+  padding: 14px 16px;
   border-bottom: 1px solid var(--line);
 }
 
@@ -413,8 +419,16 @@ h2 {
 
 .node-title {
   gap: 8px;
-  flex-wrap: wrap;
-  word-break: break-word;
+  flex-wrap: nowrap;
+  min-height: 28px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.node-title > span:not(.badge):not(.flag-fallback),
+.node-title > strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .country-flag,
@@ -467,11 +481,26 @@ h2 {
 
 .node-exit {
   display: flex;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   gap: 6px 12px;
-  margin-top: 5px;
+  margin-top: 6px;
   color: var(--muted);
   font-size: 12px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.node-meta {
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-exit span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .pagination {
@@ -603,10 +632,28 @@ h2 {
 
   .node-row {
     align-items: flex-start;
+    min-width: 0;
+    gap: 10px;
+    padding: 12px;
   }
 
   .node-check {
     place-items: start;
+  }
+
+  .list-scroll {
+    min-height: 440px;
+    max-height: 70vh;
+  }
+
+  .node-title,
+  .node-exit {
+    flex-wrap: wrap;
+    white-space: normal;
+  }
+
+  .node-meta {
+    white-space: normal;
   }
 
   .pagination {

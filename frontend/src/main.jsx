@@ -684,7 +684,7 @@ function NodesPage({ current, busyAction, actionMsg, onRefreshNodes, onTest, onT
   };
 
   return (
-    <section className="panel">
+    <section className="panel nodes-panel">
       <PanelHead
         icon={Network}
         title="VPNGate 节点"
@@ -947,7 +947,7 @@ function NodeList({ nodes, selectedIDs, busyAction, onToggle, onTest, onConnect 
               {node.active ? <span className="badge ok">已连接</span> : null}
               <IPTypeBadge type={node.exit_ip_info?.ip_type} />
             </div>
-            <div className="muted">
+            <div className="node-meta muted">
               ID {node.id || "-"} · Ping {node.ping || "-"} ms · Score {node.score || "-"} · {node.proto || "-"} · 探测 {node.probe_status || "not_checked"}
               {node.probe_latency_ms ? ` ${node.probe_latency_ms} ms` : ""}
             </div>
