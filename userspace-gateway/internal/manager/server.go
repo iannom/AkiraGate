@@ -32,8 +32,9 @@ const (
 	sessionCookieName    = "akiragate_session"
 	defaultIPPureInfoURL = "https://my.ippure.com/v1/info"
 	maxBatchNodeTests    = 8
-	maxBatchTestWorkers  = 5
+	maxBatchTestWorkers  = 8
 	batchProbeTimeout    = gatewayconfig.DefaultHandshakeTimeout * 70 / 100
+	batchProbeGraceTime  = 15 * time.Second
 	exitInfoRequestLimit = 16 * 1024
 	probeStatusTesting   = "testing"
 	healthCheckInterval  = 60 * time.Second
@@ -50,6 +51,8 @@ type nodeTestResult struct {
 	Node   vpngate.Node
 	Err    error
 }
+
+type nodeProbeFunc func(context.Context, string) (vpngate.Node, error)
 
 type listenerWorkerResult struct {
 	Listener gatewayconfig.Listener
@@ -775,9 +778,17 @@ func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) connect(w http.ResponseWriter, r *http.Request) {
 	var payload struct {
-		NodeID string `json:"node_id"`
+		NodeID        string `json:"node_id"`
+		ListenerName  string `json:"listener_name"`
+		ListenAddress string `json:"listen_address"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&payload)
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil && !errors.Is(err, io.EOF) {
+		s.sendError(w, http.StatusBadRequest, "请求 JSON 无效")
+		return
+	}
+	payload.NodeID = strings.TrimSpace(payload.NodeID)
+	payload.ListenerName = strings.TrimSpace(payload.ListenerName)
+	payload.ListenAddress = strings.TrimSpace(payload.ListenAddress)
 
 	s.mu.Lock()
 	if s.session != nil {
@@ -794,16 +805,40 @@ func (s *Server) connect(w http.ResponseWriter, r *http.Request) {
 			s.sendError(w, http.StatusNotFound, "节点不存在，请先刷新节点列表")
 			return
 		}
-		path, err := s.writeNodeConfig(node)
-		if err != nil {
-			s.mu.Unlock()
-			s.sendError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		config.OpenVPNConfig = path
-		nodeID = payload.NodeID
-		for idx := range s.nodes {
-			s.nodes[idx].Active = s.nodes[idx].ID == payload.NodeID
+		if payload.ListenerName != "" || payload.ListenAddress != "" {
+			if node.ConfigText == "" {
+				s.mu.Unlock()
+				s.sendError(w, http.StatusBadRequest, "节点缺少 OpenVPN 配置")
+				return
+			}
+			nextConfig, listener, err := bindNodeToListener(config, payload.NodeID, payload.ListenerName, payload.ListenAddress)
+			if err != nil {
+				s.mu.Unlock()
+				s.sendError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			if err := SaveConfig(s.configPath, nextConfig); err != nil {
+				s.mu.Unlock()
+				s.sendError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			config = nextConfig
+			s.config = nextConfig
+			delete(s.failed, payload.NodeID)
+			nodeID = payload.NodeID
+			s.logger.Info("已将节点绑定到 SOCKS5 入口", "node", payload.NodeID, "listener", listener.Name, "listen", listener.ListenAddress())
+		} else {
+			path, err := s.writeNodeConfig(node)
+			if err != nil {
+				s.mu.Unlock()
+				s.sendError(w, http.StatusInternalServerError, err.Error())
+				return
+			}
+			config.OpenVPNConfig = path
+			nodeID = payload.NodeID
+			for idx := range s.nodes {
+				s.nodes[idx].Active = s.nodes[idx].ID == payload.NodeID
+			}
 		}
 	} else {
 		if config.OpenVPNConfig == "" {
@@ -853,6 +888,55 @@ func (s *Server) refreshNodes(w http.ResponseWriter) {
 	s.sendJSON(w, map[string]any{"ok": true, "nodes": nodes})
 }
 
+func bindNodeToListener(config Config, nodeID string, listenerName string, listenAddress string) (Config, gatewayconfig.Listener, error) {
+	nodeID = strings.TrimSpace(nodeID)
+	listenerName = strings.TrimSpace(listenerName)
+	listenAddress = strings.TrimSpace(listenAddress)
+	if nodeID == "" {
+		return Config{}, gatewayconfig.Listener{}, errors.New("节点 ID 不能为空")
+	}
+	if listenerName == "" && listenAddress == "" {
+		return Config{}, gatewayconfig.Listener{}, errors.New("必须指定 SOCKS5 入口")
+	}
+
+	selectedIndex := -1
+	for idx, listener := range config.SocksListeners {
+		if !listenerSelectorMatches(listener, listenerName, listenAddress) {
+			continue
+		}
+		if selectedIndex >= 0 {
+			return Config{}, gatewayconfig.Listener{}, errors.New("SOCKS5 入口选择不唯一")
+		}
+		selectedIndex = idx
+	}
+	if selectedIndex < 0 {
+		return Config{}, gatewayconfig.Listener{}, errors.New("SOCKS5 入口不存在")
+	}
+
+	listener := config.SocksListeners[selectedIndex]
+	if !listener.IsEnabled() {
+		return Config{}, gatewayconfig.Listener{}, fmt.Errorf("SOCKS5 入口未启用: %s", listener.ListenAddress())
+	}
+	enabled := true
+	listener.BackendPolicyEnabled = &enabled
+	listener.FixedNodeID = nodeID
+
+	next := config
+	next.SocksListeners = append([]gatewayconfig.Listener(nil), config.SocksListeners...)
+	next.SocksListeners[selectedIndex] = listener
+	normalizeConfig(&next)
+	return next, next.SocksListeners[selectedIndex], nil
+}
+
+func listenerSelectorMatches(listener gatewayconfig.Listener, listenerName string, listenAddress string) bool {
+	nameMatches := listenerName != "" && strings.TrimSpace(listener.Name) == listenerName
+	addressMatches := listenAddress != "" && listener.ListenAddress() == listenAddress
+	if listenerName != "" && listenAddress != "" {
+		return nameMatches && addressMatches
+	}
+	return nameMatches || addressMatches
+}
+
 func (s *Server) testNode(w http.ResponseWriter, r *http.Request) {
 	var payload struct {
 		NodeID string `json:"node_id"`
@@ -870,12 +954,32 @@ func (s *Server) testNode(w http.ResponseWriter, r *http.Request) {
 		s.sendError(w, http.StatusBadRequest, "节点 ID 不能为空")
 		return
 	}
-	node, err := s.probeNode(context.Background(), nodeID)
-	if err != nil {
-		s.sendError(w, http.StatusInternalServerError, err.Error())
+	s.mu.Lock()
+	_, ok := s.findNodeLocked(nodeID)
+	s.mu.Unlock()
+	if !ok {
+		s.sendError(w, http.StatusNotFound, "节点不存在，请先刷新节点列表")
 		return
 	}
-	s.sendJSON(w, map[string]any{"ok": true, "node": node})
+	probeCtx, cancel := context.WithTimeout(context.Background(), gatewayconfig.DefaultHandshakeTimeout+batchProbeGraceTime)
+	defer cancel()
+	resultCh := make(chan nodeTestResult, 1)
+	go func() {
+		resultCh <- s.probeNodeTestJob(probeCtx, nodeTestJob{NodeID: nodeID}, s.probeNode)
+	}()
+
+	select {
+	case result := <-resultCh:
+		node, _ := s.normalizeNodeTestResult(result)
+		if result.Err != nil && node.ID == "" {
+			s.sendError(w, http.StatusInternalServerError, result.Err.Error())
+			return
+		}
+		s.sendJSON(w, map[string]any{"ok": true, "node": node})
+	case <-probeCtx.Done():
+		node := s.markInterruptedNodeProbe(nodeID, probeCtx.Err())
+		s.sendJSON(w, map[string]any{"ok": true, "timeout": true, "node": node})
+	}
 }
 
 func (s *Server) testNodes(w http.ResponseWriter, r *http.Request) {
@@ -913,6 +1017,9 @@ func (s *Server) testNodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.finishBatchNodeTest(batch)
+
+	testCtx, cancel := context.WithTimeout(testCtx, batchProbeTimeout+batchProbeGraceTime)
+	defer cancel()
 
 	s.markBatchNodesProbeTesting(nodeIDs)
 	results, cancelled := s.probeNodesConcurrently(testCtx, nodeIDs)
@@ -960,8 +1067,15 @@ func (s *Server) cancelBatchNodeTest() bool {
 }
 
 func (s *Server) probeNodesConcurrently(ctx context.Context, nodeIDs []string) ([]vpngate.Node, bool) {
+	return s.probeNodesConcurrentlyWith(ctx, nodeIDs, s.probeBatchNode)
+}
+
+func (s *Server) probeNodesConcurrentlyWith(ctx context.Context, nodeIDs []string, probe nodeProbeFunc) ([]vpngate.Node, bool) {
 	if len(nodeIDs) == 0 {
 		return []vpngate.Node{}, false
+	}
+	if probe == nil {
+		probe = s.probeBatchNode
 	}
 	workerCount := maxBatchTestWorkers
 	if workerCount > len(nodeIDs) {
@@ -974,8 +1088,7 @@ func (s *Server) probeNodesConcurrently(ctx context.Context, nodeIDs []string) (
 	for worker := 0; worker < workerCount; worker++ {
 		go func() {
 			for job := range jobs {
-				node, err := s.probeBatchNode(ctx, job.NodeID)
-				resultCh <- nodeTestResult{Index: job.Index, NodeID: job.NodeID, Node: node, Err: err}
+				resultCh <- s.probeNodeTestJob(ctx, job, probe)
 			}
 		}()
 	}
@@ -1000,63 +1113,97 @@ func (s *Server) probeNodesConcurrently(ctx context.Context, nodeIDs []string) (
 	completedNodes := make([]bool, len(nodeIDs))
 	expected := len(nodeIDs)
 	completed := 0
-	queuedKnown := false
 	cancelled := false
 	for completed < expected {
 		select {
 		case queued := <-queuedCh:
 			expected = queued
-			queuedKnown = true
 		case <-ctx.Done():
 			cancelled = true
-			if !queuedKnown {
-				expected = <-queuedCh
-				queuedKnown = true
-			}
-			for completed < expected {
-				select {
-				case result := <-resultCh:
-					completed++
-					if result.Err != nil && !errors.Is(result.Err, context.Canceled) {
-						s.logger.Warn("节点测试失败", "node", result.NodeID, "error", result.Err)
-						result.Node = s.markNodeProbeFailed(result.NodeID, result.Err.Error())
-					}
-					if errors.Is(result.Err, context.Canceled) {
-						result.Node = s.markNodeProbeCancelled(result.NodeID)
-					}
-					results[result.Index] = result.Node
-					completedNodes[result.Index] = true
-				}
-			}
+			completed += s.drainReadyNodeTestResults(resultCh, results, completedNodes)
 			for idx, nodeID := range nodeIDs {
 				if !completedNodes[idx] {
-					results[idx] = s.markNodeProbeCancelled(nodeID)
+					results[idx] = s.markInterruptedNodeProbe(nodeID, ctx.Err())
 				}
 			}
 			return compactNodeTestResults(results), true
 		case result := <-resultCh:
 			completed++
-			if result.Err != nil && !errors.Is(result.Err, context.Canceled) {
-				s.logger.Warn("节点测试失败", "node", result.NodeID, "error", result.Err)
-				result.Node = s.markNodeProbeFailed(result.NodeID, result.Err.Error())
-			}
-			if errors.Is(result.Err, context.Canceled) {
+			node, interrupted := s.normalizeNodeTestResult(result)
+			if interrupted {
 				cancelled = true
-				result.Node = s.markNodeProbeCancelled(result.NodeID)
 			}
-			results[result.Index] = result.Node
-			completedNodes[result.Index] = true
+			if result.Index >= 0 && result.Index < len(results) {
+				results[result.Index] = node
+				completedNodes[result.Index] = true
+			}
 		}
 	}
 	if ctx.Err() != nil || cancelled {
 		for idx, nodeID := range nodeIDs {
 			if !completedNodes[idx] {
-				results[idx] = s.markNodeProbeCancelled(nodeID)
+				results[idx] = s.markInterruptedNodeProbe(nodeID, ctx.Err())
 			}
 		}
 		return compactNodeTestResults(results), true
 	}
 	return compactNodeTestResults(results), false
+}
+
+func (s *Server) probeNodeTestJob(ctx context.Context, job nodeTestJob, probe nodeProbeFunc) (result nodeTestResult) {
+	result = nodeTestResult{Index: job.Index, NodeID: job.NodeID}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			message := fmt.Sprintf("节点测试异常: %v", recovered)
+			s.logger.Error("节点测试发生 panic", "node", job.NodeID, "panic", recovered)
+			result.Node = s.markNodeProbeFailed(job.NodeID, message)
+			result.Err = errors.New(message)
+		}
+	}()
+	result.Node, result.Err = probe(ctx, job.NodeID)
+	return result
+}
+
+func (s *Server) drainReadyNodeTestResults(resultCh <-chan nodeTestResult, results []vpngate.Node, completedNodes []bool) int {
+	completed := 0
+	for {
+		select {
+		case result := <-resultCh:
+			node, _ := s.normalizeNodeTestResult(result)
+			if result.Index >= 0 && result.Index < len(results) {
+				results[result.Index] = node
+				completedNodes[result.Index] = true
+				completed++
+			}
+		default:
+			return completed
+		}
+	}
+}
+
+func (s *Server) normalizeNodeTestResult(result nodeTestResult) (vpngate.Node, bool) {
+	if result.Err != nil {
+		if isContextDoneError(result.Err) {
+			return s.markInterruptedNodeProbe(result.NodeID, result.Err), true
+		}
+		s.logger.Warn("节点测试失败", "node", result.NodeID, "error", result.Err)
+		return s.markNodeProbeFailed(result.NodeID, result.Err.Error()), false
+	}
+	if result.Node.ID == "" {
+		return s.markNodeProbeFailed(result.NodeID, "节点测试未返回结果"), false
+	}
+	return result.Node, false
+}
+
+func isContextDoneError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func (s *Server) markInterruptedNodeProbe(nodeID string, err error) vpngate.Node {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return s.markNodeProbeFailed(nodeID, "节点测试超时")
+	}
+	return s.markNodeProbeCancelled(nodeID)
 }
 
 func compactNodeTestResults(results []vpngate.Node) []vpngate.Node {
@@ -1089,7 +1236,7 @@ func (s *Server) probeNodeWithTimeout(ctx context.Context, nodeID string, handsh
 		return vpngate.Node{}, errors.New("节点不存在")
 	}
 	if err := ctx.Err(); err != nil {
-		return s.markNodeProbeCancelled(nodeID), err
+		return s.markInterruptedNodeProbe(nodeID, err), err
 	}
 	path, err := s.writeNodeConfig(node)
 	if err != nil {
@@ -1119,7 +1266,7 @@ func (s *Server) probeNodeWithTimeout(ctx context.Context, nodeID string, handsh
 		}
 	}
 	if ctx.Err() != nil {
-		return s.markNodeProbeCancelled(nodeID), ctx.Err()
+		return s.markInterruptedNodeProbe(nodeID, ctx.Err()), ctx.Err()
 	}
 	latency := int(time.Since(started).Milliseconds())
 
@@ -1750,7 +1897,10 @@ func selectListenerNodeIDs(config Config, listener gatewayconfig.Listener, nodes
 	if limit <= 0 {
 		limit = len(nodes)
 	}
-	fixedNodeID := strings.TrimSpace(listener.FixedNodeID)
+	fixedNodeID := ""
+	if listener.BackendPolicyIsEnabled() {
+		fixedNodeID = strings.TrimSpace(listener.FixedNodeID)
+	}
 	if fixedNodeID == "" && config.RoutingMode == "fixed_ip" {
 		fixedNodeID = strings.TrimSpace(config.FixedNodeID)
 	}
@@ -1762,11 +1912,18 @@ func selectListenerNodeIDs(config Config, listener gatewayconfig.Listener, nodes
 		}
 		return []string{}, nil
 	}
-	countryCode := strings.ToUpper(strings.TrimSpace(listener.CountryCode))
+	countryCode := ""
+	if listener.BackendPolicyIsEnabled() {
+		countryCode = strings.ToUpper(strings.TrimSpace(listener.CountryCode))
+	}
 	if countryCode == "" && config.RoutingMode == "fixed_region" {
 		countryCode = strings.ToUpper(strings.TrimSpace(config.ForceCountry))
 	}
-	cidrs, err := parseCIDRs(listener.EntryCIDRs)
+	var entryCIDRs []string
+	if listener.BackendPolicyIsEnabled() {
+		entryCIDRs = listener.EntryCIDRs
+	}
+	cidrs, err := parseCIDRs(entryCIDRs)
 	if err != nil {
 		return nil, err
 	}
@@ -1841,15 +1998,7 @@ func listenerNodeEntryIP(node vpngate.Node) string {
 }
 
 func listenerHasBackendPolicy(listener gatewayconfig.Listener) bool {
-	if strings.TrimSpace(listener.CountryCode) != "" || strings.TrimSpace(listener.FixedNodeID) != "" {
-		return true
-	}
-	for _, cidr := range listener.EntryCIDRs {
-		if strings.TrimSpace(cidr) != "" {
-			return true
-		}
-	}
-	return false
+	return listener.BackendPolicyIsEnabled() && listener.HasBackendPolicyValues()
 }
 
 func failoverBackoff(retry int) time.Duration {

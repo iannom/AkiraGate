@@ -105,6 +105,41 @@ func TestLoadConfigKeepsAutoConnectWithListenerBackendPolicy(t *testing.T) {
 	if config.SocksListeners[0].CountryCode != "JP" {
 		t.Fatalf("监听器国家代码应归一化为大写，实际: %q", config.SocksListeners[0].CountryCode)
 	}
+	if !config.SocksListeners[0].BackendPolicyIsEnabled() {
+		t.Fatal("旧配置存在绑定字段时应自动启用 SOCKS5 后端绑定策略")
+	}
+}
+
+func TestLoadConfigDisablesAutoConnectWhenListenerBackendPolicyIsOff(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	data := []byte(`{
+  "web_host": "127.0.0.1",
+  "web_port": 8787,
+  "secret_path": "secret",
+  "admin_username": "admin",
+  "admin_password": "password",
+  "openvpn_config": "",
+  "auto_connect": true,
+  "refresh_seconds": 960,
+  "routing_mode": "auto",
+  "socks5_listeners": [
+    {"name": "jp", "host": "127.0.0.1", "port": 7928, "username": "proxy", "password": "password", "enabled": true, "backend_policy_enabled": false, "country_code": "jp", "entry_cidrs": ["203.0.113.0/24"]}
+  ]
+}`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("写入测试配置失败: %v", err)
+	}
+
+	config, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("读取关闭绑定策略配置失败: %v", err)
+	}
+	if config.AutoConnect {
+		t.Fatal("监听器绑定策略关闭时，无 OpenVPN 配置应关闭 auto_connect")
+	}
+	if config.SocksListeners[0].BackendPolicyIsEnabled() {
+		t.Fatal("显式关闭的 SOCKS5 后端绑定策略不应被旧字段自动重新启用")
+	}
 }
 
 func TestLoadConfigRejectsInvalidPublicSocksListener(t *testing.T) {

@@ -42,6 +42,7 @@ func TestValidateListenersTreatsMissingEnabledAsEnabled(t *testing.T) {
 
 func TestValidateListenersRejectsInvalidBackendPolicy(t *testing.T) {
 	listener := NewListener("local", "127.0.0.1", 7928, true)
+	listener.BackendPolicyEnabled = boolPtr(true)
 	listener.CountryCode = "JPN"
 	if err := ValidateListeners([]Listener{listener}); err == nil {
 		t.Fatal("无效国家代码应被拒绝")
@@ -54,8 +55,20 @@ func TestValidateListenersRejectsInvalidBackendPolicy(t *testing.T) {
 	}
 }
 
+func TestValidateListenersIgnoresDisabledBackendPolicyValues(t *testing.T) {
+	listener := NewListener("local", "127.0.0.1", 7928, true)
+	listener.BackendPolicyEnabled = boolPtr(false)
+	listener.CountryCode = "JPN"
+	listener.EntryCIDRs = []string{"not-cidr"}
+
+	if err := ValidateListeners([]Listener{listener}); err != nil {
+		t.Fatalf("关闭的 SOCKS5 后端绑定策略不应校验旧策略字段: %v", err)
+	}
+}
+
 func TestValidateListenersAllowsBackendPolicy(t *testing.T) {
 	listener := NewListener("local", "127.0.0.1", 7928, true)
+	listener.BackendPolicyEnabled = boolPtr(true)
 	listener.CountryCode = "JP"
 	listener.EntryCIDRs = []string{"203.0.113.0/24", "2001:db8::/32"}
 	listener.FixedNodeID = "jp-1"

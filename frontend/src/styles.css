@@ -395,10 +395,10 @@ h2 {
   display: grid;
   grid-template-columns:
     28px minmax(120px, 0.9fr) minmax(170px, 1.1fr) minmax(86px, 0.6fr)
-    minmax(360px, 2.4fr) minmax(132px, auto);
+    minmax(320px, 2.1fr) minmax(190px, 1fr) minmax(132px, auto);
   align-items: center;
   gap: 10px;
-  min-width: 980px;
+  min-width: 1180px;
   padding: 7px 12px;
   border-bottom: 1px solid var(--line);
 }
@@ -427,6 +427,11 @@ h2 {
   display: grid;
   place-items: center;
   margin: 0;
+}
+
+.node-listener-select {
+  min-height: 34px;
+  font-size: 12px;
 }
 
 .node-check input {
@@ -635,8 +640,8 @@ h2 {
   .node-row {
     grid-template-columns:
       28px minmax(110px, 0.9fr) minmax(160px, 1.1fr) minmax(82px, 0.6fr)
-      minmax(320px, 2.2fr) minmax(126px, auto);
-    min-width: 900px;
+      minmax(300px, 2fr) minmax(180px, 1fr) minmax(126px, auto);
+    min-width: 1100px;
   }
 
   .node-check {

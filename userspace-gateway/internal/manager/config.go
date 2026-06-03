@@ -244,6 +244,10 @@ func normalizeConfig(config *Config) {
 		listener.CountryCode = strings.ToUpper(strings.TrimSpace(listener.CountryCode))
 		listener.FixedNodeID = strings.TrimSpace(listener.FixedNodeID)
 		listener.EntryCIDRs = normalizeCIDRs(listener.EntryCIDRs)
+		if listener.BackendPolicyEnabled == nil && listener.HasBackendPolicyValues() {
+			enabled := true
+			listener.BackendPolicyEnabled = &enabled
+		}
 	}
 	if config.OpenVPNConfig == "" && !hasListenerBackendPolicy(config.SocksListeners) {
 		config.AutoConnect = false
@@ -252,14 +256,8 @@ func normalizeConfig(config *Config) {
 
 func hasListenerBackendPolicy(listeners []gatewayconfig.Listener) bool {
 	for _, listener := range listeners {
-		if strings.TrimSpace(listener.CountryCode) != "" ||
-			strings.TrimSpace(listener.FixedNodeID) != "" {
+		if listener.BackendPolicyIsEnabled() && listener.HasBackendPolicyValues() {
 			return true
-		}
-		for _, cidr := range listener.EntryCIDRs {
-			if strings.TrimSpace(cidr) != "" {
-				return true
-			}
 		}
 	}
 	return false

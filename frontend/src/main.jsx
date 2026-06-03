@@ -220,6 +220,7 @@ function defaultListener(index) {
     username: "",
     password: "",
     enabled: true,
+    backend_policy_enabled: false,
     country_code: "",
     entry_cidrs: [],
     fixed_node_id: "",
@@ -227,6 +228,11 @@ function defaultListener(index) {
 }
 
 function normalizeListener(listener, index) {
+  const hasBackendPolicyValues = Boolean(
+    listener?.country_code ||
+    listener?.fixed_node_id ||
+    (Array.isArray(listener?.entry_cidrs) && listener.entry_cidrs.length),
+  );
   return {
     name: listener?.name || `socks${index + 1}`,
     host: listener?.host || "127.0.0.1",
@@ -234,6 +240,7 @@ function normalizeListener(listener, index) {
     username: listener?.username || "",
     password: listener?.password || "",
     enabled: listener?.enabled !== false,
+    backend_policy_enabled: listener?.backend_policy_enabled === true || (listener?.backend_policy_enabled === undefined && hasBackendPolicyValues),
     country_code: listener?.country_code || "",
     entry_cidrs: Array.isArray(listener?.entry_cidrs) ? listener.entry_cidrs : [],
     fixed_node_id: listener?.fixed_node_id || "",
@@ -245,6 +252,22 @@ function parseCIDRInput(value) {
     .split(/[\n,]+/)
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function formatListenAddress(listener) {
+  const host = String(listener?.host || "127.0.0.1").trim();
+  const port = Number(listener?.port || 0);
+  if (!port) {
+    return "";
+  }
+  const addressHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  return `${addressHost}:${port}`;
+}
+
+function listenerDisplayName(listener, index) {
+  const name = String(listener?.name || `socks${index + 1}`).trim();
+  const address = formatListenAddress(listener);
+  return address ? `${name} (${address})` : name;
 }
 
 function apiBaseFromConfig(config) {
@@ -502,6 +525,7 @@ function App() {
         username: String(listener.username || "").trim(),
         password: String(listener.password || "").trim(),
         enabled: listener.enabled !== false,
+        backend_policy_enabled: listener.backend_policy_enabled === true,
         country_code: String(listener.country_code || "").trim().toUpperCase(),
         entry_cidrs: Array.isArray(listener.entry_cidrs)
           ? listener.entry_cidrs.map((value) => String(value || "").trim()).filter(Boolean)
@@ -560,11 +584,11 @@ function App() {
       (result) => result.message || "已启动",
     );
 
-  const connectNode = (nodeID) =>
+  const connectNode = (nodeID, listenAddress) =>
     runAction(
       `connect-${nodeID}`,
       "正在连接节点...",
-      () => api("connect", { method: "POST", body: JSON.stringify({ node_id: nodeID }) }),
+      () => api("connect", { method: "POST", body: JSON.stringify({ node_id: nodeID, listen_address: listenAddress }) }),
       (result) => result.message || "已启动",
     );
 
@@ -807,6 +831,7 @@ function NodesPage({
   onConnect,
 }) {
   const nodes = current?.nodes || [];
+  const listeners = current?.socks5_listeners || [];
   const batchTesting = Boolean(batchTestActive);
   const cancellingBatchTest = Boolean(batchCancelPending);
   const batchActionActive = batchTesting || cancellingBatchTest;
@@ -870,6 +895,18 @@ function NodesPage({
   useEffect(() => {
     setSelectedIDs((previous) => previous.filter((id) => nodes.some((node) => node.id === id)));
   }, [nodes]);
+
+  const listenerOptions = useMemo(
+    () =>
+      listeners
+        .map((listener, index) => ({
+          key: formatListenAddress(listener),
+          label: listenerDisplayName(listener, index),
+          enabled: listener.enabled !== false,
+        }))
+        .filter((listener) => listener.key && listener.enabled),
+    [listeners],
+  );
 
   const updateFilter = (field, value) => {
     setFilters((previous) => ({ ...previous, [field]: value }));
@@ -953,6 +990,7 @@ function NodesPage({
         selectedIDs={selectedIDs}
         busyAction={busyAction}
         batchTesting={batchActionActive}
+        listenerOptions={listenerOptions}
         onToggle={toggleNode}
         onTest={onTest}
         onConnect={onConnect}
@@ -1298,7 +1336,31 @@ function formatExitQualityText(node) {
     .join(" / ");
 }
 
-function NodeList({ nodes, selectedIDs, busyAction, batchTesting, onToggle, onTest, onConnect }) {
+function NodeList({ nodes, selectedIDs, busyAction, batchTesting, listenerOptions, onToggle, onTest, onConnect }) {
+  const defaultListenerKey = listenerOptions[0]?.key || "";
+  const [selectedListeners, setSelectedListeners] = useState({});
+
+  useEffect(() => {
+    setSelectedListeners((previous) => {
+      const nodeIDs = new Set(nodes.map((node) => String(node.id || "")).filter(Boolean));
+      const listenerKeys = new Set(listenerOptions.map((listener) => listener.key));
+      let changed = false;
+      const next = {};
+      for (const [nodeID, listenerKey] of Object.entries(previous)) {
+        if (!nodeIDs.has(nodeID)) {
+          changed = true;
+          continue;
+        }
+        if (listenerKey && !listenerKeys.has(listenerKey)) {
+          changed = true;
+          continue;
+        }
+        next[nodeID] = listenerKey;
+      }
+      return changed ? next : previous;
+    });
+  }, [listenerOptions, nodes]);
+
   if (!nodes.length) {
     return <div className="readout">暂无匹配节点。</div>;
   }
@@ -1310,6 +1372,7 @@ function NodeList({ nodes, selectedIDs, busyAction, batchTesting, onToggle, onTe
         <span>节点地址</span>
         <span>状态</span>
         <span>真实出口测试</span>
+        <span>绑定入口</span>
         <span>操作</span>
       </div>
       {nodes.map((node) => {
@@ -1317,6 +1380,8 @@ function NodeList({ nodes, selectedIDs, busyAction, batchTesting, onToggle, onTe
         const hasNodeID = Boolean(nodeID);
         const nodeTesting = node.probe_status === "testing";
         const nodeActionDisabled = batchTesting || nodeTesting || !hasNodeID;
+        const selectedListener = selectedListeners[nodeID] || defaultListenerKey;
+        const connectDisabled = nodeActionDisabled || !selectedListener;
         return (
           <div className={`node-row ${nodeTesting ? "testing" : ""}`} key={node.id || `${node.remote_host}-${node.remote_port}`}>
             <label className="node-check">
@@ -1336,9 +1401,23 @@ function NodeList({ nodes, selectedIDs, busyAction, batchTesting, onToggle, onTe
             <div className="node-cell mono">{formatEndpoint(node)}</div>
             <div className="node-cell muted">{formatProbeStatus(node)}</div>
             <ExitTestInfo node={node} />
+            <select
+              className="node-listener-select"
+              value={selectedListener}
+              disabled={nodeActionDisabled || !listenerOptions.length}
+              aria-label={`选择节点 ${node.id || node.remote_host || ""} 绑定的 SOCKS5 入口`}
+              onChange={(event) => setSelectedListeners((previous) => ({ ...previous, [nodeID]: event.target.value }))}
+            >
+              {listenerOptions.length ? null : <option value="">无可用入口</option>}
+              {listenerOptions.map((listener) => (
+                <option key={listener.key} value={listener.key}>
+                  {listener.label}
+                </option>
+              ))}
+            </select>
             <div className="row-actions">
               <ActionButton icon={Zap} label={nodeTesting ? "测试中" : "测试"} compact busy={busyAction === `test-${nodeID}` || nodeTesting} disabled={nodeActionDisabled} onClick={() => onTest(nodeID)} />
-              <ActionButton icon={Play} label="连接" compact busy={busyAction === `connect-${nodeID}`} disabled={batchTesting || !hasNodeID} onClick={() => onConnect(nodeID)} />
+              <ActionButton icon={Play} label="连接" compact busy={busyAction === `connect-${nodeID}`} disabled={connectDisabled} onClick={() => onConnect(nodeID, selectedListener)} />
             </div>
           </div>
         );
@@ -1441,33 +1520,45 @@ function ListenerEditor({ listeners, onUpdate, onRemove }) {
   }
   return (
     <div className="listener-list">
-      {listeners.map((listener, index) => (
-        <div className="listener" key={`${listener.name}-${index}`}>
-          <div className="listener-head">
-            <strong>{listener.name || `socks${index + 1}`}</strong>
-            <ActionButton icon={Trash2} label="删除" danger compact onClick={() => onRemove(index)} />
+      {listeners.map((listener, index) => {
+        const backendPolicyEnabled = listener.backend_policy_enabled === true;
+        return (
+          <div className="listener" key={`${listener.name}-${index}`}>
+            <div className="listener-head">
+              <strong>{listener.name || `socks${index + 1}`}</strong>
+              <ActionButton icon={Trash2} label="删除" danger compact onClick={() => onRemove(index)} />
+            </div>
+            <div className="form-grid">
+              <TextInput label="名称" value={listener.name} onChange={(value) => onUpdate(index, "name", value)} />
+              <SelectInput
+                label="启用"
+                value={String(listener.enabled !== false)}
+                onChange={(value) => onUpdate(index, "enabled", value === "true")}
+                options={[
+                  ["true", "启用"],
+                  ["false", "停用"],
+                ]}
+              />
+              <TextInput label="监听地址" value={listener.host} onChange={(value) => onUpdate(index, "host", value)} />
+              <TextInput label="监听端口" type="number" min="1024" max="65535" value={listener.port} onChange={(value) => onUpdate(index, "port", value)} />
+              <TextInput label="SOCKS5 用户名" value={listener.username} onChange={(value) => onUpdate(index, "username", value)} autoComplete="off" placeholder="留空则无鉴权" />
+              <TextInput label="SOCKS5 密码" type="password" value={listener.password} onChange={(value) => onUpdate(index, "password", value)} autoComplete="new-password" placeholder="公网监听必须填写" />
+              <SelectInput
+                label="绑定策略"
+                value={String(backendPolicyEnabled)}
+                onChange={(value) => onUpdate(index, "backend_policy_enabled", value === "true")}
+                options={[
+                  ["false", "关闭"],
+                  ["true", "开启"],
+                ]}
+              />
+              <TextInput label="绑定国家代码" value={listener.country_code} onChange={(value) => onUpdate(index, "country_code", value)} placeholder="JP" disabled={!backendPolicyEnabled} />
+              <TextInput label="绑定入口网段" value={(listener.entry_cidrs || []).join("\n")} onChange={(value) => onUpdate(index, "entry_cidrs", parseCIDRInput(value))} placeholder="203.0.113.0/24" disabled={!backendPolicyEnabled} />
+              <TextInput label="绑定节点 ID" value={listener.fixed_node_id} onChange={(value) => onUpdate(index, "fixed_node_id", value)} placeholder="可选，优先级最高" disabled={!backendPolicyEnabled} />
+            </div>
           </div>
-          <div className="form-grid">
-            <TextInput label="名称" value={listener.name} onChange={(value) => onUpdate(index, "name", value)} />
-            <SelectInput
-              label="启用"
-              value={String(listener.enabled !== false)}
-              onChange={(value) => onUpdate(index, "enabled", value === "true")}
-              options={[
-                ["true", "启用"],
-                ["false", "停用"],
-              ]}
-            />
-            <TextInput label="监听地址" value={listener.host} onChange={(value) => onUpdate(index, "host", value)} />
-            <TextInput label="监听端口" type="number" min="1024" max="65535" value={listener.port} onChange={(value) => onUpdate(index, "port", value)} />
-            <TextInput label="SOCKS5 用户名" value={listener.username} onChange={(value) => onUpdate(index, "username", value)} autoComplete="off" placeholder="留空则无鉴权" />
-            <TextInput label="SOCKS5 密码" type="password" value={listener.password} onChange={(value) => onUpdate(index, "password", value)} autoComplete="new-password" placeholder="公网监听必须填写" />
-            <TextInput label="绑定国家代码" value={listener.country_code} onChange={(value) => onUpdate(index, "country_code", value)} placeholder="JP" />
-            <TextInput label="绑定入口网段" value={(listener.entry_cidrs || []).join("\n")} onChange={(value) => onUpdate(index, "entry_cidrs", parseCIDRInput(value))} placeholder="203.0.113.0/24" />
-            <TextInput label="绑定节点 ID" value={listener.fixed_node_id} onChange={(value) => onUpdate(index, "fixed_node_id", value)} placeholder="可选，优先级最高" />
-          </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }

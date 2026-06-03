@@ -24,15 +24,16 @@ type Config struct {
 }
 
 type Listener struct {
-	Name        string   `json:"name"`
-	Host        string   `json:"host"`
-	Port        int      `json:"port"`
-	Username    string   `json:"username,omitempty"`
-	Password    string   `json:"password,omitempty"`
-	Enabled     *bool    `json:"enabled,omitempty"`
-	CountryCode string   `json:"country_code,omitempty"`
-	EntryCIDRs  []string `json:"entry_cidrs,omitempty"`
-	FixedNodeID string   `json:"fixed_node_id,omitempty"`
+	Name                 string   `json:"name"`
+	Host                 string   `json:"host"`
+	Port                 int      `json:"port"`
+	Username             string   `json:"username,omitempty"`
+	Password             string   `json:"password,omitempty"`
+	Enabled              *bool    `json:"enabled,omitempty"`
+	BackendPolicyEnabled *bool    `json:"backend_policy_enabled,omitempty"`
+	CountryCode          string   `json:"country_code,omitempty"`
+	EntryCIDRs           []string `json:"entry_cidrs,omitempty"`
+	FixedNodeID          string   `json:"fixed_node_id,omitempty"`
 }
 
 func DefaultListener() Listener {
@@ -63,6 +64,22 @@ func (l Listener) HasAuth() bool {
 
 func (l Listener) IsEnabled() bool {
 	return l.Enabled == nil || *l.Enabled
+}
+
+func (l Listener) BackendPolicyIsEnabled() bool {
+	return l.BackendPolicyEnabled != nil && *l.BackendPolicyEnabled
+}
+
+func (l Listener) HasBackendPolicyValues() bool {
+	if strings.TrimSpace(l.CountryCode) != "" || strings.TrimSpace(l.FixedNodeID) != "" {
+		return true
+	}
+	for _, cidr := range l.EntryCIDRs {
+		if strings.TrimSpace(cidr) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (c Config) Validate() error {
@@ -125,6 +142,9 @@ func ValidateListeners(listeners []Listener) error {
 }
 
 func validateListenerBackendPolicy(listener Listener) error {
+	if !listener.BackendPolicyIsEnabled() {
+		return nil
+	}
 	if listener.CountryCode != "" && !validCountryCode(listener.CountryCode) {
 		return fmt.Errorf("SOCKS5 监听 %s 的绑定国家代码无效: %s", listener.ListenAddress(), listener.CountryCode)
 	}

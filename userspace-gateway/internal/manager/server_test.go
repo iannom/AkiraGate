@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -425,6 +426,90 @@ func TestConnectRejectsVPNGateNodesWithoutOpenVPNOrListenerPolicy(t *testing.T) 
 	}
 }
 
+func TestConnectRejectsDisabledListenerBackendPolicy(t *testing.T) {
+	server := testServer(t)
+	server.config.OpenVPNConfig = ""
+	listener := server.config.SocksListeners[0]
+	listener.BackendPolicyEnabled = boolPtr(false)
+	listener.CountryCode = "JP"
+	server.config.SocksListeners[0] = listener
+	server.nodes = []vpngate.Node{{
+		ID:         "jp-1",
+		ConfigText: "client\nremote 203.0.113.10 1194\n",
+	}}
+	req := httptest.NewRequest(http.MethodPost, "/secret/api/connect", nil)
+	addLoginCookie(t, server, req)
+	rec := httptest.NewRecorder()
+
+	server.route(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("绑定策略关闭时不应把国家代码当作可用策略，实际: %d", rec.Code)
+	}
+	if server.session != nil {
+		t.Fatal("绑定策略关闭的连接失败后不应创建会话")
+	}
+}
+
+func TestBindNodeToListenerSetsFixedNodePolicy(t *testing.T) {
+	config := testConfig()
+	listener := config.SocksListeners[0]
+	listener.BackendPolicyEnabled = boolPtr(false)
+	listener.CountryCode = "JP"
+	listener.EntryCIDRs = []string{"203.0.113.0/24"}
+	config.SocksListeners[0] = listener
+
+	next, bound, err := bindNodeToListener(config, "jp-1", "", "127.0.0.1:7928")
+	if err != nil {
+		t.Fatalf("绑定节点到 SOCKS5 入口失败: %v", err)
+	}
+	if !bound.BackendPolicyIsEnabled() {
+		t.Fatal("节点绑定后应启用入口绑定策略")
+	}
+	if bound.FixedNodeID != "jp-1" {
+		t.Fatalf("入口应固定到选择的节点，实际: %q", bound.FixedNodeID)
+	}
+	if bound.CountryCode != "JP" || len(bound.EntryCIDRs) != 1 {
+		t.Fatalf("固定节点绑定不应清理旧国家/网段策略: %+v", bound)
+	}
+	if next.SocksListeners[0].FixedNodeID != "jp-1" {
+		t.Fatalf("返回配置应包含新绑定: %+v", next.SocksListeners[0])
+	}
+	if config.SocksListeners[0].FixedNodeID != "" {
+		t.Fatal("绑定函数不应原地修改输入配置")
+	}
+}
+
+func TestConnectNodeToListenerPersistsConfigAndClearsFailedNode(t *testing.T) {
+	server := testServer(t)
+	server.nodes = []vpngate.Node{{
+		ID:         "jp-1",
+		ConfigText: "client\nremote 203.0.113.10 1194\n",
+	}}
+	server.failed["jp-1"] = "previous failure"
+	req := httptest.NewRequest(http.MethodPost, "/secret/api/connect", bytes.NewReader([]byte(`{"node_id":"jp-1","listen_address":"127.0.0.1:7928"}`)))
+	addLoginCookie(t, server, req)
+	rec := httptest.NewRecorder()
+
+	server.route(rec, req)
+	defer server.disconnect(httptest.NewRecorder())
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("绑定节点到入口并连接应成功，实际: %d %s", rec.Code, rec.Body.String())
+	}
+	if _, failed := server.failed["jp-1"]; failed {
+		t.Fatal("显式绑定节点后应清理该节点的失败状态")
+	}
+	config, err := LoadConfig(server.configPath)
+	if err != nil {
+		t.Fatalf("读取持久化配置失败: %v", err)
+	}
+	listener := config.SocksListeners[0]
+	if !listener.BackendPolicyIsEnabled() || listener.FixedNodeID != "jp-1" {
+		t.Fatalf("绑定节点应持久化到配置文件: %+v", listener)
+	}
+}
+
 func TestFetchIPPureInfoParsesExitProfile(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -465,6 +550,22 @@ func TestTestNodeRejectsMissingNodeID(t *testing.T) {
 
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("缺少节点 ID 应返回 400，实际: %d", rec.Code)
+	}
+}
+
+func TestTestNodeRejectsUnknownNodeID(t *testing.T) {
+	server := testServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/secret/api/test_node", bytes.NewReader([]byte(`{"node_id":"missing"}`)))
+	addLoginCookie(t, server, req)
+	rec := httptest.NewRecorder()
+
+	server.route(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("不存在节点 ID 应返回 404，实际: %d", rec.Code)
+	}
+	if _, failed := server.failed["missing"]; failed {
+		t.Fatal("不存在节点测试不应污染失败节点表")
 	}
 }
 
@@ -580,6 +681,78 @@ func TestProbeNodesConcurrentlyMarksCancelledNodes(t *testing.T) {
 		if node.ProbeStatus != "cancelled" || node.ProbeMessage != "批量测试已取消" {
 			t.Fatalf("取消节点应标记为 cancelled: %+v", node)
 		}
+	}
+}
+
+func TestProbeNodesConcurrentlyCancelsHungProbe(t *testing.T) {
+	server := testServer(t)
+	server.nodes = []vpngate.Node{{
+		ID:           "node-a",
+		ProbeStatus:  probeStatusTesting,
+		ProbeMessage: "正在测试节点真实出口",
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+
+	probe := func(context.Context, string) (vpngate.Node, error) {
+		close(started)
+		<-release
+		return vpngate.Node{ID: "node-a", ProbeStatus: "available"}, nil
+	}
+	done := make(chan struct {
+		nodes     []vpngate.Node
+		cancelled bool
+	}, 1)
+	go func() {
+		nodes, cancelled := server.probeNodesConcurrentlyWith(ctx, []string{"node-a"}, probe)
+		done <- struct {
+			nodes     []vpngate.Node
+			cancelled bool
+		}{nodes: nodes, cancelled: cancelled}
+	}()
+
+	select {
+	case <-started:
+		cancel()
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("测试探测函数未启动")
+	}
+
+	select {
+	case result := <-done:
+		if !result.cancelled {
+			t.Fatal("取消后的批量测试应返回 cancelled=true")
+		}
+		if len(result.nodes) != 1 || result.nodes[0].ProbeStatus != "cancelled" {
+			t.Fatalf("未返回的节点应被标记为 cancelled: %+v", result.nodes)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("底层探测不返回时批量测试不应阻塞等待")
+	}
+}
+
+func TestProbeNodesConcurrentlyMarksPanicAsFailure(t *testing.T) {
+	server := testServer(t)
+	server.nodes = []vpngate.Node{{
+		ID:           "node-a",
+		ProbeStatus:  probeStatusTesting,
+		ProbeMessage: "正在测试节点真实出口",
+	}}
+	probe := func(context.Context, string) (vpngate.Node, error) {
+		panic("boom")
+	}
+
+	nodes, cancelled := server.probeNodesConcurrentlyWith(context.Background(), []string{"node-a"}, probe)
+	if cancelled {
+		t.Fatal("探测 panic 不应被标记为取消")
+	}
+	if len(nodes) != 1 || nodes[0].ProbeStatus != "unavailable" {
+		t.Fatalf("探测 panic 应返回失败节点: %+v", nodes)
+	}
+	if !strings.Contains(nodes[0].ProbeMessage, "节点测试异常") {
+		t.Fatalf("探测 panic 应包含可读失败原因: %+v", nodes[0])
 	}
 }
 
@@ -748,6 +921,7 @@ func TestSelectListenerNodeIDsHonorsListenerPolicy(t *testing.T) {
 		{ID: "us-1", CountryShort: "US", RemoteHost: "192.0.2.10", IP: "192.0.2.10"},
 	}
 	listener := gatewayconfig.NewListener("local", "127.0.0.1", 7928, true)
+	listener.BackendPolicyEnabled = boolPtr(true)
 	listener.CountryCode = "JP"
 	listener.EntryCIDRs = []string{"203.0.113.0/24"}
 
@@ -760,11 +934,31 @@ func TestSelectListenerNodeIDsHonorsListenerPolicy(t *testing.T) {
 	}
 }
 
+func TestSelectListenerNodeIDsIgnoresPolicyValuesWhenPolicyDisabled(t *testing.T) {
+	nodes := []vpngate.Node{
+		{ID: "jp-1", CountryShort: "JP", RemoteHost: "203.0.113.10", IP: "198.51.100.10"},
+		{ID: "us-1", CountryShort: "US", RemoteHost: "192.0.2.10", IP: "192.0.2.10"},
+	}
+	listener := gatewayconfig.NewListener("local", "127.0.0.1", 7928, true)
+	listener.BackendPolicyEnabled = boolPtr(false)
+	listener.CountryCode = "JP"
+	listener.EntryCIDRs = []string{"203.0.113.0/24"}
+
+	ids, err := selectListenerNodeIDs(testConfig(), listener, nodes, nil, 10)
+	if err != nil {
+		t.Fatalf("监听器策略关闭时选择节点失败: %v", err)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("绑定策略关闭时不应按国家或入口 CIDR 过滤节点，实际: %+v", ids)
+	}
+}
+
 func TestSelectListenerNodeIDsUsesVPNGateIPWhenRemoteHostIsDomain(t *testing.T) {
 	nodes := []vpngate.Node{
 		{ID: "jp-1", CountryShort: "JP", RemoteHost: "vpn.example.test", IP: "203.0.113.20"},
 	}
 	listener := gatewayconfig.NewListener("local", "127.0.0.1", 7928, true)
+	listener.BackendPolicyEnabled = boolPtr(true)
 	listener.EntryCIDRs = []string{"203.0.113.0/24"}
 
 	ids, err := selectListenerNodeIDs(testConfig(), listener, nodes, nil, 10)
@@ -782,6 +976,7 @@ func TestSelectListenerNodeIDsPrefersListenerFixedNode(t *testing.T) {
 		{ID: "jp-2", CountryShort: "US", RemoteHost: "192.0.2.20"},
 	}
 	listener := gatewayconfig.NewListener("local", "127.0.0.1", 7928, true)
+	listener.BackendPolicyEnabled = boolPtr(true)
 	listener.CountryCode = "JP"
 	listener.EntryCIDRs = []string{"203.0.113.0/24"}
 	listener.FixedNodeID = "jp-2"
@@ -815,6 +1010,10 @@ func testConfig() Config {
 			gatewayconfig.NewListener("local", "127.0.0.1", 7928, true),
 		},
 	}
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }
 
 func addLoginCookie(t *testing.T, server *Server, req *http.Request) {
