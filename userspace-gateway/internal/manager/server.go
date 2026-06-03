@@ -1007,9 +1007,6 @@ func (s *Server) testNodes(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.Unlock()
 	}
-	if len(nodeIDs) > maxBatchNodeTests {
-		nodeIDs = nodeIDs[:maxBatchNodeTests]
-	}
 
 	testCtx, batch, ok := s.startBatchNodeTest()
 	if !ok {
@@ -1017,9 +1014,6 @@ func (s *Server) testNodes(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.finishBatchNodeTest(batch)
-
-	testCtx, cancel := context.WithTimeout(testCtx, batchProbeTimeout+batchProbeGraceTime)
-	defer cancel()
 
 	s.markBatchNodesProbeTesting(nodeIDs)
 	results, cancelled := s.probeNodesConcurrently(testCtx, nodeIDs)
@@ -1067,19 +1061,43 @@ func (s *Server) cancelBatchNodeTest() bool {
 }
 
 func (s *Server) probeNodesConcurrently(ctx context.Context, nodeIDs []string) ([]vpngate.Node, bool) {
-	return s.probeNodesConcurrentlyWith(ctx, nodeIDs, s.probeBatchNode)
+	if len(nodeIDs) == 0 {
+		return []vpngate.Node{}, false
+	}
+	workerCount := batchProbeWorkerCount(len(nodeIDs))
+	watchdogCtx, cancel := context.WithTimeout(ctx, batchProbeWatchdogTimeout(len(nodeIDs), workerCount))
+	defer cancel()
+	return s.probeNodesConcurrentlyWith(watchdogCtx, nodeIDs, workerCount, s.probeBatchNode)
 }
 
-func (s *Server) probeNodesConcurrentlyWith(ctx context.Context, nodeIDs []string, probe nodeProbeFunc) ([]vpngate.Node, bool) {
+func batchProbeWorkerCount(nodeCount int) int {
+	if nodeCount <= 0 {
+		return 0
+	}
+	workerCount := maxBatchTestWorkers
+	if workerCount > nodeCount {
+		workerCount = nodeCount
+	}
+	return workerCount
+}
+
+func batchProbeWatchdogTimeout(nodeCount int, workerCount int) time.Duration {
+	if nodeCount <= 0 || workerCount <= 0 {
+		return batchProbeTimeout + batchProbeGraceTime
+	}
+	batches := (nodeCount + workerCount - 1) / workerCount
+	return time.Duration(batches) * (batchProbeTimeout + batchProbeGraceTime)
+}
+
+func (s *Server) probeNodesConcurrentlyWith(ctx context.Context, nodeIDs []string, workerCount int, probe nodeProbeFunc) ([]vpngate.Node, bool) {
 	if len(nodeIDs) == 0 {
 		return []vpngate.Node{}, false
 	}
 	if probe == nil {
 		probe = s.probeBatchNode
 	}
-	workerCount := maxBatchTestWorkers
-	if workerCount > len(nodeIDs) {
-		workerCount = len(nodeIDs)
+	if workerCount <= 0 || workerCount > len(nodeIDs) {
+		workerCount = batchProbeWorkerCount(len(nodeIDs))
 	}
 	jobs := make(chan nodeTestJob)
 	resultCh := make(chan nodeTestResult, len(nodeIDs))

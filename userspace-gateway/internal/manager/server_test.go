@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -609,6 +610,30 @@ func TestProbeNodesConcurrentlyReturnsFailedNodes(t *testing.T) {
 	}
 }
 
+func TestProbeNodesConcurrentlyReturnsMoreThanEightNodes(t *testing.T) {
+	server := testServer(t)
+	nodeIDs := make([]string, 12)
+	for idx := range nodeIDs {
+		nodeIDs[idx] = fmt.Sprintf("node-%02d", idx)
+	}
+	probe := func(_ context.Context, nodeID string) (vpngate.Node, error) {
+		return vpngate.Node{ID: nodeID, ProbeStatus: "available"}, nil
+	}
+
+	nodes, cancelled := server.probeNodesConcurrentlyWith(context.Background(), nodeIDs, batchProbeWorkerCount(len(nodeIDs)), probe)
+	if cancelled {
+		t.Fatal("未取消的批量测试不应返回 cancelled=true")
+	}
+	if len(nodes) != len(nodeIDs) {
+		t.Fatalf("批量测试应返回所有节点结果，实际: %d，预期: %d", len(nodes), len(nodeIDs))
+	}
+	for idx, node := range nodes {
+		if node.ID != nodeIDs[idx] {
+			t.Fatalf("批量测试结果顺序或节点 ID 不符合预期，idx=%d node=%+v", idx, node)
+		}
+	}
+}
+
 func TestBatchNodeTestLifecycleRejectsConcurrentBatch(t *testing.T) {
 	server := testServer(t)
 
@@ -625,6 +650,14 @@ func TestBatchNodeTestLifecycleRejectsConcurrentBatch(t *testing.T) {
 		t.Fatal("批量测试结束后应允许再次启动")
 	} else {
 		server.finishBatchNodeTest(batch)
+	}
+}
+
+func TestBatchProbeWatchdogTimeoutScalesByWorkerBatches(t *testing.T) {
+	timeout := batchProbeWatchdogTimeout(17, 8)
+	expected := 3 * (batchProbeTimeout + batchProbeGraceTime)
+	if timeout != expected {
+		t.Fatalf("批量测试 watchdog 应按 worker 批次数扩展，实际: %v，预期: %v", timeout, expected)
 	}
 }
 
@@ -706,7 +739,7 @@ func TestProbeNodesConcurrentlyCancelsHungProbe(t *testing.T) {
 		cancelled bool
 	}, 1)
 	go func() {
-		nodes, cancelled := server.probeNodesConcurrentlyWith(ctx, []string{"node-a"}, probe)
+		nodes, cancelled := server.probeNodesConcurrentlyWith(ctx, []string{"node-a"}, 1, probe)
 		done <- struct {
 			nodes     []vpngate.Node
 			cancelled bool
@@ -733,6 +766,63 @@ func TestProbeNodesConcurrentlyCancelsHungProbe(t *testing.T) {
 	}
 }
 
+func TestProbeNodesConcurrentlyTimesOutHungProbe(t *testing.T) {
+	server := testServer(t)
+	nodeIDs := []string{"node-a", "node-b", "node-c"}
+	for _, nodeID := range nodeIDs {
+		server.nodes = append(server.nodes, vpngate.Node{
+			ID:           nodeID,
+			ProbeStatus:  probeStatusTesting,
+			ProbeMessage: "正在测试节点真实出口",
+		})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := make(chan struct{}, len(nodeIDs))
+	release := make(chan struct{})
+	defer close(release)
+
+	probe := func(context.Context, string) (vpngate.Node, error) {
+		started <- struct{}{}
+		<-release
+		return vpngate.Node{}, nil
+	}
+	done := make(chan struct {
+		nodes     []vpngate.Node
+		cancelled bool
+	}, 1)
+	go func() {
+		nodes, cancelled := server.probeNodesConcurrentlyWith(ctx, nodeIDs, 2, probe)
+		done <- struct {
+			nodes     []vpngate.Node
+			cancelled bool
+		}{nodes: nodes, cancelled: cancelled}
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("测试探测函数未启动")
+	}
+
+	select {
+	case result := <-done:
+		if !result.cancelled {
+			t.Fatal("deadline 后批量测试应返回 cancelled=true")
+		}
+		if len(result.nodes) != len(nodeIDs) {
+			t.Fatalf("deadline 后应返回所有节点状态，实际: %d", len(result.nodes))
+		}
+		for _, node := range result.nodes {
+			if node.ProbeStatus != "unavailable" || node.ProbeMessage != "节点测试超时" {
+				t.Fatalf("deadline 后节点应标记为超时失败: %+v", node)
+			}
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("底层探测不返回时 deadline 应自动收敛")
+	}
+}
+
 func TestProbeNodesConcurrentlyMarksPanicAsFailure(t *testing.T) {
 	server := testServer(t)
 	server.nodes = []vpngate.Node{{
@@ -744,7 +834,7 @@ func TestProbeNodesConcurrentlyMarksPanicAsFailure(t *testing.T) {
 		panic("boom")
 	}
 
-	nodes, cancelled := server.probeNodesConcurrentlyWith(context.Background(), []string{"node-a"}, probe)
+	nodes, cancelled := server.probeNodesConcurrentlyWith(context.Background(), []string{"node-a"}, 1, probe)
 	if cancelled {
 		t.Fatal("探测 panic 不应被标记为取消")
 	}
