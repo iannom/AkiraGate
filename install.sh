@@ -97,6 +97,36 @@ json_number() {
     sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p" "$CONFIG_FILE" | head -n1
 }
 
+is_os_like() {
+    target="$1"
+    if [ "${ID:-}" = "$target" ]; then
+        return 0
+    fi
+    case " ${ID_LIKE:-} " in
+        *" ${target} "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+install_debian_packages() {
+    if ! command -v apt-get >/dev/null 2>&1; then
+        echo -e "${RED}检测到 Debian 系统标识，但找不到 apt-get。${PLAIN}"
+        exit 1
+    fi
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -q
+    apt-get install -y \
+        bash \
+        ca-certificates \
+        curl \
+        git \
+        gzip \
+        openssl \
+        psmisc \
+        tar \
+        xz-utils
+}
+
 install_go() {
     arch="$(uname -m)"
     case "$arch" in
@@ -138,21 +168,23 @@ install_packages() {
     if [ -f /etc/os-release ]; then . /etc/os-release; else ID=""; fi
     case "${ID:-}" in
         ubuntu|debian)
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update -q || true
-            apt-get install -y curl git ca-certificates psmisc tar xz-utils golang-go nodejs npm || true
+            install_debian_packages
             ;;
         alpine)
-            apk update || true
-            apk add curl git ca-certificates psmisc bash tar xz go nodejs npm || true
+            apk update
+            apk add curl git ca-certificates psmisc bash tar xz go nodejs npm
             ;;
         centos|rhel|rocky|almalinux|fedora)
             mgr="yum"; command -v dnf >/dev/null 2>&1 && mgr="dnf"
-            $mgr install -y curl git ca-certificates psmisc tar xz golang nodejs npm || $mgr install -y curl git ca-certificates psmisc tar xz go nodejs npm || true
+            $mgr install -y curl git ca-certificates psmisc tar xz golang nodejs npm || $mgr install -y curl git ca-certificates psmisc tar xz go nodejs npm
             ;;
         *)
-            echo -e "${RED}不支持的操作系统。${PLAIN}"
-            exit 1
+            if is_os_like debian || is_os_like ubuntu; then
+                install_debian_packages
+            else
+                echo -e "${RED}不支持的操作系统。当前仅自动适配 Debian/Ubuntu、Alpine、RHEL/Fedora 系。${PLAIN}"
+                exit 1
+            fi
             ;;
     esac
     installed="$(current_go_version || true)"
