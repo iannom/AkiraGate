@@ -7,6 +7,7 @@ CONFIG_FILE="${AIMILI_DEV_CONFIG:-${DEV_DIR}/config.json}"
 WEB_PORT="${AIMILI_DEV_WEB_PORT:-18787}"
 VITE_PORT="${AIMILI_DEV_VITE_PORT:-5173}"
 SOCKS_PORT="${AIMILI_DEV_SOCKS_PORT:-17928}"
+LISTEN_HOST="${AIMILI_DEV_LISTEN_HOST:-0.0.0.0}"
 SECRET_PATH="${AIMILI_DEV_SECRET_PATH:-dev}"
 ADMIN_USERNAME="${AIMILI_DEV_ADMIN_USERNAME:-admin}"
 ADMIN_PASSWORD="${AIMILI_DEV_ADMIN_PASSWORD:-password}"
@@ -80,7 +81,7 @@ write_default_config() {
     fi
     cat > "$CONFIG_FILE" <<EOF
 {
-  "web_host": "127.0.0.1",
+  "web_host": "${LISTEN_HOST}",
   "web_port": ${WEB_PORT},
   "secret_path": "${SECRET_PATH}",
   "admin_username": "${ADMIN_USERNAME}",
@@ -95,7 +96,7 @@ write_default_config() {
   "socks5_listeners": [
     {
       "name": "local-dev",
-      "host": "127.0.0.1",
+      "host": "${LISTEN_HOST}",
       "port": ${SOCKS_PORT},
       "username": "${SOCKS_USERNAME}",
       "password": "${SOCKS_PASSWORD}",
@@ -149,7 +150,7 @@ start_frontend() {
     cd "${ROOT_DIR}/frontend"
     VITE_DEV_SECRET_PATH="$SECRET_PATH" \
     VITE_DEV_API_ORIGIN="$1" \
-    npm run dev -- --host 127.0.0.1 --port "$VITE_PORT" &
+    npm run dev -- --host "$LISTEN_HOST" --port "$VITE_PORT" &
     frontend_pid="$!"
 }
 

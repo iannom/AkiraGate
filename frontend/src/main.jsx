@@ -622,19 +622,12 @@ function NodesPage({ current, busyAction, actionMsg, onRefreshNodes, onTest, onT
         return true;
       }
       const haystack = [
-        node.id,
         node.country,
         node.country_short,
-        node.ip,
-        node.hostname,
-        node.remote_host,
-        node.proto,
-        node.probe_status,
-        node.exit_ip_info?.ip,
-        node.exit_ip_info?.asn,
-        node.exit_ip_info?.as_organization,
-        node.exit_ip_info?.organization,
-        node.exit_ip_info?.country,
+        formatEndpoint(node),
+        formatNodeLatency(node),
+        formatProbeLatency(node),
+        formatExitQualityText(node),
       ]
         .filter(Boolean)
         .join(" ")
@@ -696,7 +689,7 @@ function NodesPage({ current, busyAction, actionMsg, onRefreshNodes, onTest, onT
           <input
             value={filters.keyword}
             onChange={(event) => updateFilter("keyword", event.target.value)}
-            placeholder="搜索 IP、ASN、企业、国家或节点 ID"
+            placeholder="搜索 IP、ASN、企业、国家或延迟"
           />
         </div>
         <select value={filters.country} onChange={(event) => updateFilter("country", event.target.value)}>
@@ -923,42 +916,89 @@ function ActionButton({ icon: Icon, label, onClick, primary = false, danger = fa
   );
 }
 
+function formatEndpoint(node) {
+  const host = node.remote_host || node.ip || "-";
+  return node.remote_port ? `${host}:${node.remote_port}` : host;
+}
+
+function formatNodeLatency(node) {
+  return Number.isFinite(Number(node.ping)) && Number(node.ping) > 0 ? `${node.ping} ms` : "-";
+}
+
+function formatProbeLatency(node) {
+  const latency = Number(node.probe_latency_ms);
+  if (Number.isFinite(latency) && latency > 0) {
+    return `${latency} ms`;
+  }
+  return node.probe_status && node.probe_status !== "not_checked" ? "无延迟" : "未测试";
+}
+
+function formatIPTypeLabel(type) {
+  return ipTypeOptions.find(([value]) => value === type)?.[1] || "未知";
+}
+
+function formatExitQualityText(node) {
+  const info = node.exit_ip_info;
+  if (!info) {
+    if (node.probe_status === "unavailable") {
+      return node.probe_message ? `失败: ${node.probe_message}` : "失败";
+    }
+    return "无质量信息";
+  }
+
+  const location = [info.country, info.city].filter(Boolean).join(" / ");
+  return [
+    formatIPTypeLabel(info.ip_type),
+    info.ip,
+    info.asn,
+    info.as_organization || info.organization,
+    location,
+    Number.isFinite(Number(info.fraud_score)) ? `Fraud ${info.fraud_score}` : "",
+  ]
+    .filter(Boolean)
+    .join(" / ");
+}
+
 function NodeList({ nodes, selectedIDs, busyAction, onToggle, onTest, onConnect }) {
   if (!nodes.length) {
     return <div className="readout">暂无匹配节点。</div>;
   }
   return (
     <div className="list-scroll">
-      {nodes.map((node) => (
-        <div className="node-row" key={node.id || `${node.remote_host}-${node.remote_port}`}>
-          <label className="node-check">
-            <input
-              type="checkbox"
-              checked={selectedIDs.includes(node.id)}
-              onChange={() => onToggle(node.id)}
-              aria-label={`选择节点 ${node.id || node.remote_host || ""}`}
-            />
-          </label>
-          <div className="node-main">
+      <div className="node-row node-head" aria-hidden="true">
+        <span></span>
+        <span>国家</span>
+        <span>节点地址</span>
+        <span>质量</span>
+        <span>真实出口测试</span>
+        <span>操作</span>
+      </div>
+      {nodes.map((node) => {
+        return (
+          <div className="node-row" key={node.id || `${node.remote_host}-${node.remote_port}`}>
+            <label className="node-check">
+              <input
+                type="checkbox"
+                checked={selectedIDs.includes(node.id)}
+                onChange={() => onToggle(node.id)}
+                aria-label={`选择节点 ${node.id || node.remote_host || ""}`}
+              />
+            </label>
             <div className="node-title">
               <CountryFlag code={node.country_short} label={node.country} />
               <strong>{node.country || node.country_short || "-"}</strong>
-              <span>{node.remote_host || node.ip || ""}:{node.remote_port || ""}</span>
               {node.active ? <span className="badge ok">已连接</span> : null}
-              <IPTypeBadge type={node.exit_ip_info?.ip_type} />
             </div>
-            <div className="node-meta muted">
-              ID {node.id || "-"} · Ping {node.ping || "-"} ms · Score {node.score || "-"} · {node.proto || "-"} · 探测 {node.probe_status || "not_checked"}
-              {node.probe_latency_ms ? ` ${node.probe_latency_ms} ms` : ""}
+            <div className="node-cell mono">{formatEndpoint(node)}</div>
+            <div className="node-cell muted">{formatNodeLatency(node)}</div>
+            <ExitTestInfo node={node} />
+            <div className="row-actions">
+              <ActionButton icon={Zap} label="测试" compact busy={busyAction === `test-${node.id}`} onClick={() => onTest(node.id)} />
+              <ActionButton icon={Play} label="连接" compact busy={busyAction === `connect-${node.id}`} onClick={() => onConnect(node.id)} />
             </div>
-            <ExitInfo info={node.exit_ip_info} />
           </div>
-          <div className="row-actions">
-            <ActionButton icon={Zap} label="测试" compact busy={busyAction === `test-${node.id}`} onClick={() => onTest(node.id)} />
-            <ActionButton icon={Play} label="连接" compact busy={busyAction === `connect-${node.id}`} onClick={() => onConnect(node.id)} />
-          </div>
-        </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
@@ -979,24 +1019,14 @@ function CountryFlag({ code, label }) {
   );
 }
 
-function IPTypeBadge({ type }) {
-  const normalized = type || "unknown";
-  const label = ipTypeOptions.find(([value]) => value === normalized)?.[1] || "未知";
-  return <span className={`badge ip-type ${normalized}`}>{label}</span>;
-}
-
-function ExitInfo({ info }) {
-  if (!info) {
-    return <div className="node-exit muted">真实出口未测试</div>;
-  }
-  const location = [info.country, info.city].filter(Boolean).join(" / ");
+function ExitTestInfo({ node }) {
+  const latency = formatProbeLatency(node);
+  const quality = formatExitQualityText(node);
   return (
-    <div className="node-exit">
-      <span>出口 {info.ip || "-"}</span>
-      <span>{info.asn || "-"}</span>
-      <span>{info.as_organization || info.organization || "-"}</span>
-      {location ? <span>{location}</span> : null}
-      {Number.isFinite(Number(info.fraud_score)) ? <span>Fraud {info.fraud_score}</span> : null}
+    <div className="node-exit-test" title={`${latency} • ${quality}`}>
+      <span className="node-latency muted">{latency}</span>
+      <span className="node-separator muted">•</span>
+      <span className="node-quality">{quality}</span>
     </div>
   );
 }
