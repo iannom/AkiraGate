@@ -1,10 +1,10 @@
 # ============================================
-#  AimiliVPN .gitignore
+#  AkiraGate .gitignore
 # ============================================
 
 # ---- Go 编译产物 ----
-userspace-gateway/aimilivpn-server
-userspace-gateway/aimilivpn-gateway
+userspace-gateway/akiragate-server
+userspace-gateway/akiragate-gateway
 
 # ---- 前端依赖和构建产物 ----
 frontend/node_modules/
@@ -12,7 +12,7 @@ frontend/dist/
 
 # ---- Debian 打包产物 ----
 *.deb
-aimilivpn_*
+akiragate_*
 
 # ---- 运行时数据 ----
 .dev/
@@ -44,7 +44,7 @@ logs/
 # ---- 本地开发文档（不上传 GitHub） ----
 AI开发指令.md
 功能文档.md
-AimiliVPN_Analysis_ZH.md
+AkiraGate_Analysis_ZH.md
 
 # ---- 临时和测试文件 ----
 scratch/

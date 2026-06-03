@@ -70,7 +70,7 @@ func FetchNodes(client *http.Client, apiURL string) ([]Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "AimiliVPN-Go/1.0")
+	req.Header.Set("User-Agent", "AkiraGate-Go/1.0")
 	res, err := client.Do(req)
 	if err != nil {
 		return nil, err

@@ -66,7 +66,7 @@ func (s *Server) Serve(ctx context.Context) error {
 	s.listener = listener
 	s.mu.Unlock()
 	s.logger.Info("SOCKS5 网关已启动", "listen", listener.Addr().String(), "auth", s.auth.Enabled())
-	fmt.Printf("AIMILI_GATEWAY_READY listen=%s auth=%t\n", listener.Addr().String(), s.auth.Enabled())
+	fmt.Printf("AKIRAGATE_GATEWAY_READY listen=%s auth=%t\n", listener.Addr().String(), s.auth.Enabled())
 
 	go func() {
 		<-ctx.Done()

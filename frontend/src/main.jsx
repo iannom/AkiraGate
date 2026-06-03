@@ -457,7 +457,7 @@ function App() {
     return (
       <main className="auth-shell">
         <form className="auth-panel" onSubmit={login}>
-          <p className="eyebrow">AimiliVPN</p>
+          <p className="eyebrow">AkiraGate</p>
           <h1>登录管理端</h1>
           <div className="stacked-fields">
             <TextInput label="管理账号" value={loginForm.username} onChange={(value) => setLoginForm((previous) => ({ ...previous, username: value }))} autoComplete="username" />
@@ -479,8 +479,8 @@ function App() {
     <main className="shell">
       <header className="topbar">
         <div>
-          <p className="eyebrow">AimiliVPN</p>
-          <h1>AimiliVPN 管理端</h1>
+          <p className="eyebrow">AkiraGate</p>
+          <h1>AkiraGate 管理端</h1>
           <p className="muted">用户态 OpenVPN、多 SOCKS5 端口、可选用户名密码鉴权</p>
         </div>
         <div className="topbar-actions">
@@ -625,8 +625,7 @@ function NodesPage({ current, busyAction, actionMsg, onRefreshNodes, onTest, onT
         node.country,
         node.country_short,
         formatEndpoint(node),
-        formatNodeLatency(node),
-        formatProbeLatency(node),
+        formatProbeStatus(node),
         formatExitQualityText(node),
       ]
         .filter(Boolean)
@@ -689,7 +688,7 @@ function NodesPage({ current, busyAction, actionMsg, onRefreshNodes, onTest, onT
           <input
             value={filters.keyword}
             onChange={(event) => updateFilter("keyword", event.target.value)}
-            placeholder="搜索 IP、ASN、企业、国家或延迟"
+            placeholder="搜索 IP、ASN、企业、国家或状态"
           />
         </div>
         <select value={filters.country} onChange={(event) => updateFilter("country", event.target.value)}>
@@ -760,7 +759,7 @@ function SettingsPage({ form, saveMsg, busyAction, onUpdateForm, onSave }) {
         <TextInput label="登录安全后缀" value={form.secret_path} onChange={(value) => onUpdateForm("secret_path", value)} />
         <TextInput label="管理账号" value={form.admin_username} onChange={(value) => onUpdateForm("admin_username", value)} />
         <TextInput label="管理密码" type="password" value={form.admin_password} onChange={(value) => onUpdateForm("admin_password", value)} placeholder="留空表示不修改" autoComplete="new-password" />
-        <TextInput label="OpenVPN auth-user-pass 文件" value={form.openvpn_auth} onChange={(value) => onUpdateForm("openvpn_auth", value)} placeholder="/opt/aimilivpn/vpngate_auth.txt" />
+        <TextInput label="OpenVPN auth-user-pass 文件" value={form.openvpn_auth} onChange={(value) => onUpdateForm("openvpn_auth", value)} placeholder="/opt/akiragate/vpngate_auth.txt" />
         <SelectInput
           label="自动连接 VPNGate 节点"
           value={String(form.auto_connect)}
@@ -785,7 +784,7 @@ function SettingsPage({ form, saveMsg, busyAction, onUpdateForm, onSave }) {
       </div>
       <div className="stacked-fields">
         <TextInput label="固定节点 ID" value={form.fixed_node_id} onChange={(value) => onUpdateForm("fixed_node_id", value)} placeholder="从节点列表复制 ID" />
-        <TextInput label="OpenVPN 配置文件" value={form.openvpn_config} onChange={(value) => onUpdateForm("openvpn_config", value)} placeholder="/opt/aimilivpn/client.ovpn" />
+        <TextInput label="OpenVPN 配置文件" value={form.openvpn_config} onChange={(value) => onUpdateForm("openvpn_config", value)} placeholder="/opt/akiragate/client.ovpn" />
       </div>
       <div className="actions form-actions">
         <ActionButton icon={Save} label="保存设置" primary busy={busyAction === "save"} onClick={onSave} />
@@ -921,27 +920,120 @@ function formatEndpoint(node) {
   return node.remote_port ? `${host}:${node.remote_port}` : host;
 }
 
-function formatNodeLatency(node) {
-  return Number.isFinite(Number(node.ping)) && Number(node.ping) > 0 ? `${node.ping} ms` : "-";
-}
-
-function formatProbeLatency(node) {
-  const latency = Number(node.probe_latency_ms);
-  if (Number.isFinite(latency) && latency > 0) {
-    return `${latency} ms`;
+function formatProbeStatus(node) {
+  const status = node.probe_status || "not_checked";
+  if (status === "not_checked") {
+    return "未测试";
   }
-  return node.probe_status && node.probe_status !== "not_checked" ? "无延迟" : "未测试";
+  if (status === "unavailable") {
+    return "不可用";
+  }
+
+  const latency = Number(node.probe_latency_ms);
+  return Number.isFinite(latency) && latency > 0 ? `${latency} ms` : "可用";
 }
 
 function formatIPTypeLabel(type) {
   return ipTypeOptions.find(([value]) => value === type)?.[1] || "未知";
 }
 
+function includesAny(text, keywords) {
+  return keywords.some((keyword) => text.includes(keyword));
+}
+
+function formatProbeFailureText(message) {
+  const raw = String(message || "").trim();
+  if (!raw) {
+    return "测试失败";
+  }
+
+  const text = raw.toLowerCase();
+  if (includesAny(raw, ["节点不存在"])) {
+    return "节点已失效，请刷新列表";
+  }
+  if (includesAny(raw, ["节点缺少 OpenVPN 配置", "OpenVPN 配置路径不能为空", "OpenVPN 配置不可读"])) {
+    return "OpenVPN 配置不可用";
+  }
+  if (includesAny(text, ["auth_failed", "auth-failed", "authentication failed", "username", "password"]) || includesAny(raw, ["认证", "用户名", "密码"])) {
+    return "OpenVPN 认证失败";
+  }
+  if (includesAny(text, ["x509", "certificate", "tls"]) || includesAny(raw, ["证书"])) {
+    return "TLS 或证书校验失败";
+  }
+  if (includesAny(raw, ["OpenVPN 未下发有效 IPv4 地址"])) {
+    return "隧道地址获取失败";
+  }
+  if (includesAny(raw, ["初始化用户态 TCP/IP 栈失败", "创建用户态链路端点失败", "创建用户态 NIC 失败", "配置用户态 IPv4 地址失败"])) {
+    return "用户态网络栈初始化失败";
+  }
+  if (includesAny(raw, ["临时 SOCKS5 服务异常退出"])) {
+    return "临时代理异常退出";
+  }
+  if (includesAny(raw, ["临时 SOCKS5 服务启动失败"])) {
+    return "临时代理启动失败";
+  }
+  if (includesAny(raw, ["等待临时 SOCKS5 服务启动超时"])) {
+    return "临时代理启动超时";
+  }
+  if (includesAny(raw, ["解析目标域名失败"])) {
+    return "出口检测域名解析失败";
+  }
+  if (includesAny(raw, ["域名没有可用 IP"])) {
+    return "出口检测域名无可用 IP";
+  }
+  if (includesAny(raw, ["目标主机不能为空", "目标端口不能为空"])) {
+    return "出口检测目标无效";
+  }
+  if (includesAny(raw, ["用户态 TCP 连接失败"])) {
+    if (includesAny(text, ["timeout", "deadline exceeded", "i/o timeout"]) || includesAny(raw, ["超时"])) {
+      return "出口检测连接超时";
+    }
+    if (includesAny(text, ["connection refused", "refused"]) || includesAny(raw, ["拒绝"])) {
+      return "出口检测连接被拒绝";
+    }
+    if (includesAny(text, ["unreachable", "no route"]) || includesAny(raw, ["不可达"])) {
+      return "出口检测网络不可达";
+    }
+    return "出口检测连接失败";
+  }
+  if (includesAny(raw, ["ippure 出口画像 HTTP"])) {
+    return "出口画像服务异常";
+  }
+  if (includesAny(raw, ["解析 ippure 出口画像失败"])) {
+    return "出口画像解析失败";
+  }
+  if (includesAny(raw, ["ippure 返回的出口 IP 无效"])) {
+    return "出口画像返回无效 IP";
+  }
+  if (includesAny(raw, ["启动用户态 OpenVPN 隧道失败"])) {
+    if (includesAny(text, ["timeout", "deadline exceeded", "i/o timeout"]) || includesAny(raw, ["超时"])) {
+      return "OpenVPN 握手超时";
+    }
+    if (includesAny(text, ["handshake"]) || includesAny(raw, ["握手"])) {
+      return "OpenVPN 握手失败";
+    }
+    if (includesAny(text, ["connection refused", "refused"]) || includesAny(raw, ["拒绝"])) {
+      return "节点拒绝连接";
+    }
+    if (includesAny(text, ["unreachable", "no route"]) || includesAny(raw, ["不可达"])) {
+      return "节点网络不可达";
+    }
+    return "OpenVPN 连接失败";
+  }
+  if (includesAny(text, ["context canceled"]) || includesAny(raw, ["取消"])) {
+    return "测试已取消";
+  }
+  if (includesAny(text, ["timeout", "deadline exceeded", "i/o timeout"]) || includesAny(raw, ["超时"])) {
+    return "测试超时";
+  }
+  return "测试失败";
+}
+
 function formatExitQualityText(node) {
   const info = node.exit_ip_info;
   if (!info) {
     if (node.probe_status === "unavailable") {
-      return node.probe_message ? `失败: ${node.probe_message}` : "失败";
+      return formatProbeFailureText(node.probe_message);
     }
     return "无质量信息";
   }
@@ -969,7 +1061,7 @@ function NodeList({ nodes, selectedIDs, busyAction, onToggle, onTest, onConnect 
         <span></span>
         <span>国家</span>
         <span>节点地址</span>
-        <span>质量</span>
+        <span>状态</span>
         <span>真实出口测试</span>
         <span>操作</span>
       </div>
@@ -990,7 +1082,7 @@ function NodeList({ nodes, selectedIDs, busyAction, onToggle, onTest, onConnect 
               {node.active ? <span className="badge ok">已连接</span> : null}
             </div>
             <div className="node-cell mono">{formatEndpoint(node)}</div>
-            <div className="node-cell muted">{formatNodeLatency(node)}</div>
+            <div className="node-cell muted">{formatProbeStatus(node)}</div>
             <ExitTestInfo node={node} />
             <div className="row-actions">
               <ActionButton icon={Zap} label="测试" compact busy={busyAction === `test-${node.id}`} onClick={() => onTest(node.id)} />
@@ -1020,12 +1112,9 @@ function CountryFlag({ code, label }) {
 }
 
 function ExitTestInfo({ node }) {
-  const latency = formatProbeLatency(node);
   const quality = formatExitQualityText(node);
   return (
-    <div className="node-exit-test" title={`${latency} • ${quality}`}>
-      <span className="node-latency muted">{latency}</span>
-      <span className="node-separator muted">•</span>
+    <div className="node-exit-test" title={quality}>
       <span className="node-quality">{quality}</span>
     </div>
   );

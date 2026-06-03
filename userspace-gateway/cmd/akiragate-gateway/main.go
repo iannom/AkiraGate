@@ -13,8 +13,8 @@ import (
 	"strings"
 	"syscall"
 
-	"aimilivpn/userspace-gateway/internal/app"
-	"aimilivpn/userspace-gateway/internal/config"
+	"akiragate/userspace-gateway/internal/app"
+	"akiragate/userspace-gateway/internal/config"
 )
 
 func main() {
@@ -23,8 +23,8 @@ func main() {
 	flag.Var(&listenerFlags, "socks5", "SOCKS5 listener: host:port or host:port,username,password. Repeatable.")
 	listenHost := flag.String("listen-host", "", "deprecated: SOCKS5 listen host")
 	listenPort := flag.Int("listen-port", 0, "deprecated: SOCKS5 listen port")
-	flag.StringVar(&cfg.OpenVPNConfigPath, "ovpn", os.Getenv("AIMILI_GATEWAY_OVPN"), "OpenVPN client configuration path")
-	flag.StringVar(&cfg.AuthFilePath, "auth-file", os.Getenv("AIMILI_GATEWAY_AUTH_FILE"), "OpenVPN auth-user-pass file")
+	flag.StringVar(&cfg.OpenVPNConfigPath, "ovpn", os.Getenv("AKIRAGATE_GATEWAY_OVPN"), "OpenVPN client configuration path")
+	flag.StringVar(&cfg.AuthFilePath, "auth-file", os.Getenv("AKIRAGATE_GATEWAY_AUTH_FILE"), "OpenVPN auth-user-pass file")
 	flag.DurationVar(&cfg.ConnectTimeout, "connect-timeout", config.DefaultConnectTimeout, "OpenVPN and outbound TCP connect timeout")
 	flag.DurationVar(&cfg.HandshakeTimeout, "handshake-timeout", config.DefaultHandshakeTimeout, "OpenVPN userspace tunnel startup timeout")
 	flag.Parse()
@@ -37,7 +37,7 @@ func main() {
 	}
 	if len(cfg.Listeners) == 0 {
 		logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-		logger.Error("必须通过 --socks5 或 AIMILI_SOCKS5_LISTENERS 显式指定 SOCKS5 监听；公网监听必须包含用户名和密码")
+		logger.Error("必须通过 --socks5 或 AKIRAGATE_SOCKS5_LISTENERS 显式指定 SOCKS5 监听；公网监听必须包含用户名和密码")
 		os.Exit(2)
 	}
 
@@ -87,10 +87,10 @@ func (f *listenerFlag) Set(value string) error {
 }
 
 func listenersFromEnv() []config.Listener {
-	raw := os.Getenv("AIMILI_SOCKS5_LISTENERS")
+	raw := os.Getenv("AKIRAGATE_SOCKS5_LISTENERS")
 	if raw == "" {
-		host := getenv("AIMILI_GATEWAY_HOST", "")
-		portValue := os.Getenv("AIMILI_GATEWAY_PORT")
+		host := getenv("AKIRAGATE_GATEWAY_HOST", "")
+		portValue := os.Getenv("AKIRAGATE_GATEWAY_PORT")
 		if host == "" || portValue == "" {
 			return nil
 		}
@@ -99,8 +99,8 @@ func listenersFromEnv() []config.Listener {
 			return nil
 		}
 		listener := config.NewListener("default", host, port, true)
-		listener.Username = os.Getenv("AIMILI_SOCKS5_USERNAME")
-		listener.Password = os.Getenv("AIMILI_SOCKS5_PASSWORD")
+		listener.Username = os.Getenv("AKIRAGATE_SOCKS5_USERNAME")
+		listener.Password = os.Getenv("AKIRAGATE_SOCKS5_PASSWORD")
 		return []config.Listener{listener}
 	}
 

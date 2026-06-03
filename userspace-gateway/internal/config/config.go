@@ -67,7 +67,7 @@ func (c Config) Validate() error {
 		return err
 	}
 	if c.OpenVPNConfigPath == "" {
-		return errors.New("必须通过 --ovpn 或 AIMILI_GATEWAY_OVPN 指定 OpenVPN 配置")
+		return errors.New("必须通过 --ovpn 或 AKIRAGATE_GATEWAY_OVPN 指定 OpenVPN 配置")
 	}
 	if _, err := os.Stat(c.OpenVPNConfigPath); err != nil {
 		return fmt.Errorf("OpenVPN 配置不可读: %w", err)

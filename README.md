@@ -1,21 +1,21 @@
-# AimiliVPN
+# AkiraGate
 
-AimiliVPN 现在使用 **Go 用户态后端 + React 前端**：Go 管理服务负责配置保存、OpenVPN 用户态隧道、用户态 TCP/IP 栈和 SOCKS5 网关；React/Vite 前端作为独立目录构建后由 Go 服务托管。旧 Python 管理端已移除，不再作为安装脚本或运行时入口。
+AkiraGate 现在使用 **Go 用户态后端 + React 前端**：Go 管理服务负责配置保存、OpenVPN 用户态隧道、用户态 TCP/IP 栈和 SOCKS5 网关；React/Vite 前端作为独立目录构建后由 Go 服务托管。旧 Python 管理端已移除，不再作为安装脚本或运行时入口。
 
 ## 一键部署
 
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
+bash <(curl -Ls https://raw.githubusercontent.com/iannom/AkiraGate/main/install.sh)
 ```
 
 部署脚本会：
 
 - 安装 Go 工具链。
 - 安装满足 Vite 要求的 Node.js 工具链。
-- 构建 `userspace-gateway/aimilivpn-server` 和 `userspace-gateway/aimilivpn-gateway`。
+- 构建 `userspace-gateway/akiragate-server` 和 `userspace-gateway/akiragate-gateway`。
 - 构建 `frontend/dist` React 管理端静态文件。
-- 创建 `aimilivpn.service`，直接启动 Go 管理服务。
-- 生成 `/opt/aimilivpn/aimili_data/config.json`。
+- 创建 `akiragate.service`，直接启动 Go 管理服务。
+- 生成 `/opt/akiragate/akiragate_data/config.json`。
 
 终端会输出 Web 管理地址、管理账号和初始密码。管理端使用应用内登录会话，后端 API 会校验登录 Cookie。
 
@@ -38,7 +38,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/ma
 默认配置路径：
 
 ```text
-/opt/aimilivpn/aimili_data/config.json
+/opt/akiragate/akiragate_data/config.json
 ```
 
 示例：
@@ -50,8 +50,8 @@ bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/ma
   "secret_path": "examplepath",
   "admin_username": "admin",
   "admin_password_hash": "$2a$10$example-bcrypt-hash",
-  "openvpn_config": "/opt/aimilivpn/client.ovpn",
-  "openvpn_auth": "/opt/aimilivpn/aimili_data/vpngate_auth.txt",
+  "openvpn_config": "/opt/akiragate/client.ovpn",
+  "openvpn_auth": "/opt/akiragate/akiragate_data/vpngate_auth.txt",
   "auto_connect": true,
   "refresh_seconds": 960,
   "routing_mode": "auto",
@@ -120,7 +120,7 @@ bash dev.sh
 ```bash
 cd userspace-gateway
 go test ./...
-go run ./cmd/aimilivpn-server --config ../aimili_data/config.json --web-root ../frontend/dist
+go run ./cmd/akiragate-server --config ../akiragate_data/config.json --web-root ../frontend/dist
 ```
 
 前端：
@@ -141,4 +141,4 @@ npm run build
 
 ## 旧 Python 端
 
-旧 Python 管理端已经从仓库中移除。当前部署、管理 API、VPNGate 节点连接和 SOCKS5 网关均以 `userspace-gateway/cmd/aimilivpn-server` 为准，管理页面源码位于 `frontend/`。
+旧 Python 管理端已经从仓库中移除。当前部署、管理 API、VPNGate 节点连接和 SOCKS5 网关均以 `userspace-gateway/cmd/akiragate-server` 为准，管理页面源码位于 `frontend/`。

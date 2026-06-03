@@ -1,6 +1,6 @@
-# AimiliVPN 前端
+# AkiraGate 前端
 
-AimiliVPN 管理端前端使用 React + Vite，构建产物由 Go 管理服务通过 `--web-root` 托管。
+AkiraGate 管理端前端使用 React + Vite，构建产物由 Go 管理服务通过 `--web-root` 托管。
 
 ## 本地开发
 
@@ -37,5 +37,5 @@ npm run build
 部署时让 Go 管理服务指向构建目录：
 
 ```bash
-aimilivpn-server --config /opt/aimilivpn/aimili_data/config.json --web-root /opt/aimilivpn/frontend/dist
+akiragate-server --config /opt/akiragate/akiragate_data/config.json --web-root /opt/akiragate/frontend/dist
 ```

@@ -7,16 +7,16 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;36m'
 PLAIN='\033[0m'
 
-INSTALL_DIR="${INSTALL_DIR:-/opt/aimilivpn}"
-DATA_DIR="${AIMILI_DATA_DIR:-${INSTALL_DIR}/aimili_data}"
-CONFIG_FILE="${AIMILI_CONFIG:-${DATA_DIR}/config.json}"
+INSTALL_DIR="${INSTALL_DIR:-/opt/akiragate}"
+DATA_DIR="${AKIRAGATE_DATA_DIR:-${INSTALL_DIR}/akiragate_data}"
+CONFIG_FILE="${AKIRAGATE_CONFIG:-${DATA_DIR}/config.json}"
 GENERATED_ADMIN_PASSWORD=""
 REQUIRED_GO_VERSION="1.23.1"
 GO_INSTALL_VERSION="${GO_INSTALL_VERSION:-1.23.10}"
 REQUIRED_NODE_VERSION="20.19.0"
 NODE_INSTALL_VERSION="${NODE_INSTALL_VERSION:-22.12.0}"
-DEFAULT_USER="baoweise-bot"
-DEFAULT_REPO="aimili-vpngate"
+DEFAULT_USER="iannom"
+DEFAULT_REPO="AkiraGate"
 GITHUB_USER="${1:-${DEFAULT_USER}}"
 GITHUB_REPO="${2:-${DEFAULT_REPO}}"
 GITHUB_URL="https://github.com/${GITHUB_USER}/${GITHUB_REPO}.git"
@@ -180,7 +180,7 @@ deploy_source() {
     elif [ -f "${INSTALL_DIR}/userspace-gateway/go.mod" ]; then
         echo -e "${GREEN}检测到现有 Go 源码目录，直接构建。${PLAIN}"
     elif [ -d "$INSTALL_DIR" ]; then
-        echo -e "${RED}${INSTALL_DIR} 已存在但不是 AimiliVPN Go 源码目录。请备份后删除该目录再安装。${PLAIN}"
+        echo -e "${RED}${INSTALL_DIR} 已存在但不是 AkiraGate Go 源码目录。请备份后删除该目录再安装。${PLAIN}"
         exit 1
     else
         git clone -b "$DEPLOY_BRANCH" "$GITHUB_URL" "$INSTALL_DIR" || git clone "$GITHUB_URL" "$INSTALL_DIR"
@@ -189,8 +189,8 @@ deploy_source() {
 
 build_binaries() {
     cd "${INSTALL_DIR}/userspace-gateway"
-    go build -o aimilivpn-server ./cmd/aimilivpn-server
-    go build -o aimilivpn-gateway ./cmd/aimilivpn-gateway
+    go build -o akiragate-server ./cmd/akiragate-server
+    go build -o akiragate-gateway ./cmd/akiragate-gateway
 }
 
 build_frontend() {
@@ -249,22 +249,22 @@ EOF
 
 configure_service() {
     mkdir -p /etc/default
-    cat > /etc/default/aimilivpn <<EOF
-AIMILI_DATA_DIR=${DATA_DIR}
-AIMILI_CONFIG=${CONFIG_FILE}
-AIMILI_WEB_ROOT=${INSTALL_DIR}/frontend/dist
+    cat > /etc/default/akiragate <<EOF
+AKIRAGATE_DATA_DIR=${DATA_DIR}
+AKIRAGATE_CONFIG=${CONFIG_FILE}
+AKIRAGATE_WEB_ROOT=${INSTALL_DIR}/frontend/dist
 EOF
     if command -v systemctl >/dev/null 2>&1; then
-        cat > /lib/systemd/system/aimilivpn.service <<EOF
+        cat > /lib/systemd/system/akiragate.service <<EOF
 [Unit]
-Description=AimiliVPN Go userspace proxy gateway
+Description=AkiraGate Go userspace proxy gateway
 After=network.target
 
 [Service]
 Type=simple
 WorkingDirectory=${INSTALL_DIR}
-EnvironmentFile=-/etc/default/aimilivpn
-ExecStart=${INSTALL_DIR}/userspace-gateway/aimilivpn-server --config ${CONFIG_FILE} --web-root ${INSTALL_DIR}/frontend/dist
+EnvironmentFile=-/etc/default/akiragate
+ExecStart=${INSTALL_DIR}/userspace-gateway/akiragate-server --config ${CONFIG_FILE} --web-root ${INSTALL_DIR}/frontend/dist
 Restart=always
 RestartSec=5
 
@@ -272,20 +272,20 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
-        systemctl enable aimilivpn.service
+        systemctl enable akiragate.service
     elif command -v rc-service >/dev/null 2>&1; then
-        cat > /etc/init.d/aimilivpn <<EOF
+        cat > /etc/init.d/akiragate <<EOF
 #!/sbin/openrc-run
-description="AimiliVPN Go userspace proxy gateway"
-command="${INSTALL_DIR}/userspace-gateway/aimilivpn-server"
+description="AkiraGate Go userspace proxy gateway"
+command="${INSTALL_DIR}/userspace-gateway/akiragate-server"
 command_args="--config ${CONFIG_FILE} --web-root ${INSTALL_DIR}/frontend/dist"
 command_background="yes"
 directory="${INSTALL_DIR}"
-pidfile="/run/aimilivpn.pid"
+pidfile="/run/akiragate.pid"
 depend() { need net; }
 EOF
-        chmod +x /etc/init.d/aimilivpn
-        rc-update add aimilivpn default
+        chmod +x /etc/init.d/akiragate
+        rc-update add akiragate default
     fi
 }
 
@@ -294,8 +294,8 @@ install_ml() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-CONFIG_FILE="${AIMILI_CONFIG:-/opt/aimilivpn/aimili_data/config.json}"
-INSTALL_DIR="/opt/aimilivpn"
+CONFIG_FILE="${AKIRAGATE_CONFIG:-/opt/akiragate/akiragate_data/config.json}"
+INSTALL_DIR="/opt/akiragate"
 
 json_value() {
     key="$1"
@@ -304,9 +304,9 @@ json_value() {
 
 service_cmd() {
     if command -v systemctl >/dev/null 2>&1; then
-        systemctl "$1" aimilivpn.service
+        systemctl "$1" akiragate.service
     else
-        rc-service aimilivpn "$1"
+        rc-service akiragate "$1"
     fi
 }
 
@@ -319,7 +319,7 @@ status_cmd() {
         admin_password="配置已使用哈希保存，请使用安装时记录的密码或在 Web 管理端修改。"
     fi
     echo "======================================================="
-    echo "             AimiliVPN Go 管理终端"
+    echo "             AkiraGate Go 管理终端"
     echo "======================================================="
     echo "网页登录地址: http://<服务器IP>:${web_port:-8787}/${secret_path}/"
     echo "管理账号: ${admin_username}"
@@ -328,7 +328,7 @@ status_cmd() {
 }
 
 logs_cmd() {
-    journalctl -u aimilivpn.service -f -n 80
+    journalctl -u akiragate.service -f -n 80
 }
 
 update_cmd() {
@@ -338,12 +338,12 @@ update_cmd() {
 }
 
 uninstall_cmd() {
-    printf "确认卸载 AimiliVPN? (y/N): "
+    printf "确认卸载 AkiraGate? (y/N): "
     read -r ans
     [ "$ans" = "y" ] || exit 0
     service_cmd stop || true
-    systemctl disable aimilivpn.service 2>/dev/null || true
-    rm -f /lib/systemd/system/aimilivpn.service /etc/init.d/aimilivpn /usr/bin/ml
+    systemctl disable akiragate.service 2>/dev/null || true
+    rm -f /lib/systemd/system/akiragate.service /etc/init.d/akiragate /usr/bin/ml
     rm -rf "$INSTALL_DIR"
 }
 
@@ -361,9 +361,9 @@ EOF
 
 start_service() {
     if command -v systemctl >/dev/null 2>&1; then
-        systemctl restart aimilivpn.service
+        systemctl restart akiragate.service
     elif command -v rc-service >/dev/null 2>&1; then
-        rc-service aimilivpn restart || rc-service aimilivpn start
+        rc-service akiragate restart || rc-service akiragate start
     fi
 }
 
@@ -379,7 +379,7 @@ print_summary() {
 
     echo
     echo -e "${GREEN}==========================================================${PLAIN}"
-    echo -e "${GREEN}             AimiliVPN Go 后端部署已完成${PLAIN}"
+    echo -e "${GREEN}             AkiraGate Go 后端部署已完成${PLAIN}"
     echo -e "${GREEN}==========================================================${PLAIN}"
     echo "  * 网页控制面板: http://${public_ip}:${web_port:-8787}/${secret_path}/"
     echo "  * 网页管理账号: ${admin_username:-admin}"
@@ -442,7 +442,7 @@ print_socks_listeners() {
 }
 
 echo -e "${BLUE}==========================================================${PLAIN}"
-echo -e "${BLUE}        AimiliVPN Go 后端一键部署脚本${PLAIN}"
+echo -e "${BLUE}        AkiraGate Go 后端一键部署脚本${PLAIN}"
 echo -e "${BLUE}==========================================================${PLAIN}"
 install_packages
 deploy_source

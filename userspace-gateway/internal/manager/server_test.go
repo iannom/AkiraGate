@@ -10,8 +10,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	gatewayconfig "aimilivpn/userspace-gateway/internal/config"
-	"aimilivpn/userspace-gateway/internal/vpngate"
+	gatewayconfig "akiragate/userspace-gateway/internal/config"
+	"akiragate/userspace-gateway/internal/vpngate"
 )
 
 func TestRouteRequiresSessionAuth(t *testing.T) {
@@ -221,7 +221,7 @@ func TestRouteServesReactFrontendFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(webRoot, "index.html"), []byte("<!doctype html><div id=\"root\"></div>"), 0o644); err != nil {
 		t.Fatalf("写入前端入口失败: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(assetsDir, "app.js"), []byte("console.log('aimili')"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(assetsDir, "app.js"), []byte("console.log('akiragate')"), 0o644); err != nil {
 		t.Fatalf("写入前端资源失败: %v", err)
 	}
 	if err := server.SetWebRoot(webRoot); err != nil {
@@ -244,7 +244,7 @@ func TestRouteServesReactFrontendFiles(t *testing.T) {
 	if assetRec.Code != http.StatusOK {
 		t.Fatalf("前端资源请求失败: %d", assetRec.Code)
 	}
-	if assetRec.Body.String() != "console.log('aimili')" {
+	if assetRec.Body.String() != "console.log('akiragate')" {
 		t.Fatalf("前端资源内容不符合预期: %q", assetRec.Body.String())
 	}
 }

@@ -6,9 +6,9 @@ import (
 	"log/slog"
 	"sync"
 
-	"aimilivpn/userspace-gateway/internal/config"
-	"aimilivpn/userspace-gateway/internal/socks"
-	"aimilivpn/userspace-gateway/internal/vpn"
+	"akiragate/userspace-gateway/internal/config"
+	"akiragate/userspace-gateway/internal/socks"
+	"akiragate/userspace-gateway/internal/vpn"
 )
 
 type App struct {

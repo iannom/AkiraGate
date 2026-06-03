@@ -2,17 +2,17 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEV_DIR="${AIMILI_DEV_DIR:-${ROOT_DIR}/.dev}"
-CONFIG_FILE="${AIMILI_DEV_CONFIG:-${DEV_DIR}/config.json}"
-WEB_PORT="${AIMILI_DEV_WEB_PORT:-18787}"
-VITE_PORT="${AIMILI_DEV_VITE_PORT:-5173}"
-SOCKS_PORT="${AIMILI_DEV_SOCKS_PORT:-17928}"
-LISTEN_HOST="${AIMILI_DEV_LISTEN_HOST:-0.0.0.0}"
-SECRET_PATH="${AIMILI_DEV_SECRET_PATH:-dev}"
-ADMIN_USERNAME="${AIMILI_DEV_ADMIN_USERNAME:-admin}"
-ADMIN_PASSWORD="${AIMILI_DEV_ADMIN_PASSWORD:-password}"
-SOCKS_USERNAME="${AIMILI_DEV_SOCKS_USERNAME:-proxy}"
-SOCKS_PASSWORD="${AIMILI_DEV_SOCKS_PASSWORD:-password}"
+DEV_DIR="${AKIRAGATE_DEV_DIR:-${ROOT_DIR}/.dev}"
+CONFIG_FILE="${AKIRAGATE_DEV_CONFIG:-${DEV_DIR}/config.json}"
+WEB_PORT="${AKIRAGATE_DEV_WEB_PORT:-18787}"
+VITE_PORT="${AKIRAGATE_DEV_VITE_PORT:-5173}"
+SOCKS_PORT="${AKIRAGATE_DEV_SOCKS_PORT:-17928}"
+LISTEN_HOST="${AKIRAGATE_DEV_LISTEN_HOST:-0.0.0.0}"
+SECRET_PATH="${AKIRAGATE_DEV_SECRET_PATH:-dev}"
+ADMIN_USERNAME="${AKIRAGATE_DEV_ADMIN_USERNAME:-admin}"
+ADMIN_PASSWORD="${AKIRAGATE_DEV_ADMIN_PASSWORD:-password}"
+SOCKS_USERNAME="${AKIRAGATE_DEV_SOCKS_USERNAME:-proxy}"
+SOCKS_PASSWORD="${AKIRAGATE_DEV_SOCKS_PASSWORD:-password}"
 
 backend_pid=""
 frontend_pid=""
@@ -128,7 +128,7 @@ prepare_frontend() {
 
 start_backend() {
     cd "${ROOT_DIR}/userspace-gateway"
-    go run ./cmd/aimilivpn-server \
+    go run ./cmd/akiragate-server \
         --config "$CONFIG_FILE" \
         --web-root "${ROOT_DIR}/frontend/dist" &
     backend_pid="$!"
@@ -192,7 +192,7 @@ elif [ -n "${config_admin_password_hash:-}" ]; then
 fi
 
 if ! port_available "$WEB_PORT"; then
-    echo "错误: 配置文件中的 Web 端口 ${WEB_PORT} 已被占用，请修改 ${CONFIG_FILE} 或设置 AIMILI_DEV_WEB_PORT。" >&2
+    echo "错误: 配置文件中的 Web 端口 ${WEB_PORT} 已被占用，请修改 ${CONFIG_FILE} 或设置 AKIRAGATE_DEV_WEB_PORT。" >&2
     exit 1
 fi
 
@@ -204,7 +204,7 @@ start_frontend "$backend_origin"
 
 cat <<EOF
 
-AimiliVPN 本地开发环境已启动
+AkiraGate 本地开发环境已启动
 --------------------------------
 前端开发地址: http://127.0.0.1:${VITE_PORT}/
 后端管理地址: ${backend_origin}/${SECRET_PATH}/

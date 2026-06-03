@@ -21,14 +21,14 @@ import (
 	"sync"
 	"time"
 
-	gatewayconfig "aimilivpn/userspace-gateway/internal/config"
-	"aimilivpn/userspace-gateway/internal/socks"
-	"aimilivpn/userspace-gateway/internal/vpn"
-	"aimilivpn/userspace-gateway/internal/vpngate"
+	gatewayconfig "akiragate/userspace-gateway/internal/config"
+	"akiragate/userspace-gateway/internal/socks"
+	"akiragate/userspace-gateway/internal/vpn"
+	"akiragate/userspace-gateway/internal/vpngate"
 )
 
 const (
-	sessionCookieName    = "aimili_session"
+	sessionCookieName    = "akiragate_session"
 	defaultIPPureInfoURL = "https://my.ippure.com/v1/info"
 	maxBatchNodeTests    = 8
 	maxBatchTestWorkers  = 3
@@ -403,7 +403,7 @@ func (s *Server) webRootSnapshot() string {
 }
 
 func defaultWebRoot() string {
-	if value := strings.TrimSpace(os.Getenv("AIMILI_WEB_ROOT")); value != "" {
+	if value := strings.TrimSpace(os.Getenv("AKIRAGATE_WEB_ROOT")); value != "" {
 		return value
 	}
 	return filepath.Join("frontend", "dist")
@@ -1219,7 +1219,7 @@ func fetchIPPureInfo(ctx context.Context, client *http.Client, infoURL string) (
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("User-Agent", "AimiliVPN-Go/1.0")
+	req.Header.Set("User-Agent", "AkiraGate-Go/1.0")
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err

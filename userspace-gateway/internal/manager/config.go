@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	gatewayconfig "aimilivpn/userspace-gateway/internal/config"
+	gatewayconfig "akiragate/userspace-gateway/internal/config"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -264,7 +264,7 @@ func verifyPassword(hash string, password string) bool {
 func randomHex(size int) string {
 	buffer := make([]byte, size)
 	if _, err := rand.Read(buffer); err != nil {
-		return "aimili"
+		return "akiragate"
 	}
 	return hex.EncodeToString(buffer)
 }

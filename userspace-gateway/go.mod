@@ -1,4 +1,4 @@
-module aimilivpn/userspace-gateway
+module akiragate/userspace-gateway
 
 go 1.23.1
 

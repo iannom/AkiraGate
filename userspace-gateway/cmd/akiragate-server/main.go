@@ -10,13 +10,13 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"aimilivpn/userspace-gateway/internal/manager"
+	"akiragate/userspace-gateway/internal/manager"
 )
 
 func main() {
 	defaultConfig := filepath.Join(defaultDataDir(), "config.json")
-	configPath := flag.String("config", getenv("AIMILI_CONFIG", defaultConfig), "AimiliVPN Go server configuration path")
-	webRoot := flag.String("web-root", getenv("AIMILI_WEB_ROOT", filepath.Join("frontend", "dist")), "AimiliVPN frontend static files directory")
+	configPath := flag.String("config", getenv("AKIRAGATE_CONFIG", defaultConfig), "AkiraGate Go server configuration path")
+	webRoot := flag.String("web-root", getenv("AKIRAGATE_WEB_ROOT", filepath.Join("frontend", "dist")), "AkiraGate frontend static files directory")
 	flag.Parse()
 
 	logBuffer := manager.NewLogBuffer(500)
@@ -45,10 +45,10 @@ func main() {
 }
 
 func defaultDataDir() string {
-	if value := os.Getenv("AIMILI_DATA_DIR"); value != "" {
+	if value := os.Getenv("AKIRAGATE_DATA_DIR"); value != "" {
 		return value
 	}
-	return "aimili_data"
+	return "akiragate_data"
 }
 
 func getenv(name string, fallback string) string {

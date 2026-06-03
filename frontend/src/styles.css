@@ -485,11 +485,6 @@ h2 {
   font-size: 12px;
 }
 
-.node-latency,
-.node-separator {
-  flex: 0 0 auto;
-}
-
 .node-quality {
   overflow: hidden;
   text-overflow: ellipsis;
