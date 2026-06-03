@@ -34,7 +34,7 @@ type Config struct {
 
 func DefaultConfig() Config {
 	proxyPassword := randomHex(9)
-	adminPasswordHash, err := hashPassword(randomHex(9))
+	adminPasswordHash, err := HashPassword(randomHex(9))
 	if err != nil {
 		adminPasswordHash = ""
 	}
@@ -118,7 +118,7 @@ func ValidateConfig(config Config) error {
 	if config.AdminUsername == "" || config.AdminPasswordHash == "" {
 		return errors.New("管理账号和密码哈希不能为空")
 	}
-	if _, err := bcrypt.Cost([]byte(config.AdminPasswordHash)); err != nil {
+	if !validPasswordHash(config.AdminPasswordHash) {
 		return errors.New("管理密码哈希无效")
 	}
 	if err := validateRouting(config); err != nil {
@@ -207,14 +207,14 @@ func normalizeConfig(config *Config) {
 		config.AdminUsername = "admin"
 	}
 	if config.AdminPasswordHash == "" && config.AdminPassword != "" {
-		hash, err := hashPassword(config.AdminPassword)
+		hash, err := HashPassword(config.AdminPassword)
 		if err == nil {
 			config.AdminPasswordHash = hash
 		}
 	}
 	config.AdminPassword = ""
 	if config.AdminPasswordHash == "" {
-		hash, err := hashPassword(randomHex(9))
+		hash, err := HashPassword(randomHex(9))
 		if err == nil {
 			config.AdminPasswordHash = hash
 		}
@@ -283,7 +283,7 @@ func normalizeCIDRs(values []string) []string {
 	return normalized
 }
 
-func hashPassword(password string) (string, error) {
+func HashPassword(password string) (string, error) {
 	password = strings.TrimSpace(password)
 	if password == "" {
 		return "", errors.New("管理密码不能为空")
@@ -293,6 +293,14 @@ func hashPassword(password string) (string, error) {
 		return "", err
 	}
 	return string(hash), nil
+}
+
+func validPasswordHash(hash string) bool {
+	if hash == "" {
+		return false
+	}
+	_, err := bcrypt.Cost([]byte(hash))
+	return err == nil
 }
 
 func verifyPassword(hash string, password string) bool {

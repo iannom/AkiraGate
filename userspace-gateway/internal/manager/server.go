@@ -745,7 +745,7 @@ func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	passwordChanged := strings.TrimSpace(next.AdminPassword) != ""
 	if passwordChanged {
-		hash, err := hashPassword(next.AdminPassword)
+		hash, err := HashPassword(next.AdminPassword)
 		if err != nil {
 			s.sendError(w, http.StatusBadRequest, err.Error())
 			return

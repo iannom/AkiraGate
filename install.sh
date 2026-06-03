@@ -402,21 +402,39 @@ reset_password_cmd() {
         echo "管理密码长度至少需要 8 位。" >&2
         exit 1
     fi
-    if ! command -v node >/dev/null 2>&1; then
+    node_bin="$(command -v node || true)"
+    if [ -z "$node_bin" ] && [ -x /usr/local/bin/node ]; then
+        node_bin="/usr/local/bin/node"
+    fi
+    if [ -z "$node_bin" ] && [ -x /usr/local/node/bin/node ]; then
+        node_bin="/usr/local/node/bin/node"
+    fi
+    if [ -z "$node_bin" ]; then
         echo "找不到 node，无法安全更新 JSON 配置。请先重新运行安装脚本补齐依赖。" >&2
         exit 1
     fi
-    if ! command -v go >/dev/null 2>&1; then
-        echo "找不到 go，无法生成安全的密码哈希。请先重新运行安装脚本补齐依赖。" >&2
-        exit 1
-    fi
-    if [ ! -d "${INSTALL_DIR}/userspace-gateway" ]; then
-        echo "找不到后端源码目录: ${INSTALL_DIR}/userspace-gateway" >&2
-        exit 1
-    fi
 
-    hash_tmp="$(mktemp -d)"
-    cat > "${hash_tmp}/hash_password.go" <<'GOEOF'
+    server_bin="${INSTALL_DIR}/userspace-gateway/akiragate-server"
+    if [ -x "$server_bin" ]; then
+        if ! password_hash="$(printf '%s' "$new_password" | "$server_bin" --hash-password 2>/dev/null)"; then
+            password_hash=""
+        fi
+    fi
+    if [ -z "${password_hash:-}" ]; then
+        go_bin="$(command -v go || true)"
+        if [ -z "$go_bin" ] && [ -x /usr/local/go/bin/go ]; then
+            go_bin="/usr/local/go/bin/go"
+        fi
+        if [ -z "$go_bin" ]; then
+            echo "找不到 akiragate-server 或 Go，无法生成安全的密码哈希。请先运行安装脚本更新程序。" >&2
+            exit 1
+        fi
+        if [ ! -d "${INSTALL_DIR}/userspace-gateway" ]; then
+            echo "找不到后端源码目录: ${INSTALL_DIR}/userspace-gateway" >&2
+            exit 1
+        fi
+        hash_tmp="$(mktemp -d)"
+        cat > "${hash_tmp}/hash_password.go" <<'GOEOF'
 package main
 
 import (
@@ -444,12 +462,13 @@ func main() {
 	fmt.Println(string(hash))
 }
 GOEOF
-    if ! password_hash="$(printf '%s' "$new_password" | (cd "${INSTALL_DIR}/userspace-gateway" && go run "${hash_tmp}/hash_password.go"))"; then
+        if ! password_hash="$(printf '%s' "$new_password" | (cd "${INSTALL_DIR}/userspace-gateway" && "$go_bin" run "${hash_tmp}/hash_password.go"))"; then
+            rm -rf "$hash_tmp"
+            echo "生成管理密码哈希失败。" >&2
+            exit 1
+        fi
         rm -rf "$hash_tmp"
-        echo "生成管理密码哈希失败。" >&2
-        exit 1
     fi
-    rm -rf "$hash_tmp"
     if [ -z "$password_hash" ]; then
         echo "生成管理密码哈希失败。" >&2
         exit 1
@@ -458,7 +477,7 @@ GOEOF
     backup="${CONFIG_FILE}.bak.$(date +%Y%m%d%H%M%S)"
     cp -p "$CONFIG_FILE" "$backup"
     export CONFIG_FILE NEW_ADMIN_PASSWORD_HASH="$password_hash"
-    if ! node <<'NODE'
+    if ! "$node_bin" <<'NODE'
 const fs = require("fs");
 const path = process.env.CONFIG_FILE;
 const passwordHash = process.env.NEW_ADMIN_PASSWORD_HASH;

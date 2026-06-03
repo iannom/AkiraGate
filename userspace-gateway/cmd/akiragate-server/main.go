@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"akiragate/userspace-gateway/internal/manager"
@@ -17,7 +20,13 @@ func main() {
 	defaultConfig := filepath.Join(defaultDataDir(), "config.json")
 	configPath := flag.String("config", getenv("AKIRAGATE_CONFIG", defaultConfig), "AkiraGate Go server configuration path")
 	webRoot := flag.String("web-root", getenv("AKIRAGATE_WEB_ROOT", filepath.Join("frontend", "dist")), "AkiraGate frontend static files directory")
+	hashPasswordMode := flag.Bool("hash-password", false, "Read an admin password from stdin and print a bcrypt hash")
 	flag.Parse()
+
+	if *hashPasswordMode {
+		hashPasswordFromStdin()
+		return
+	}
 
 	logBuffer := manager.NewLogBuffer(500)
 	logger := slog.New(manager.NewTeeHandler(
@@ -42,6 +51,21 @@ func main() {
 		logger.Error("管理服务退出", "error", err)
 		os.Exit(1)
 	}
+}
+
+func hashPasswordFromStdin() {
+	data, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "读取密码失败: %v\n", err)
+		os.Exit(2)
+	}
+	password := strings.TrimRight(string(data), "\r\n")
+	hash, err := manager.HashPassword(password)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "生成密码哈希失败: %v\n", err)
+		os.Exit(2)
+	}
+	fmt.Println(hash)
 }
 
 func defaultDataDir() string {

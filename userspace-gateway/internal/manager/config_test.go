@@ -34,6 +34,23 @@ func TestDefaultConfigUsesAuthenticatedSocksListener(t *testing.T) {
 	}
 }
 
+func TestHashPasswordRejectsEmptyAndVerifiesHash(t *testing.T) {
+	if _, err := HashPassword("   "); err == nil {
+		t.Fatal("空管理密码不应生成哈希")
+	}
+
+	hash, err := HashPassword("new-password")
+	if err != nil {
+		t.Fatalf("生成管理密码哈希失败: %v", err)
+	}
+	if !verifyPassword(hash, "new-password") {
+		t.Fatal("生成的管理密码哈希应可通过校验")
+	}
+	if verifyPassword(hash, "wrong-password") {
+		t.Fatal("错误密码不应通过哈希校验")
+	}
+}
+
 func TestLoadConfigDisablesAutoConnectWithoutOpenVPNConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
 	data := []byte(`{

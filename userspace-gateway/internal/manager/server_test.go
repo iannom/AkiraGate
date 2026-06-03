@@ -1086,7 +1086,7 @@ func testServer(t *testing.T) *Server {
 }
 
 func testConfig() Config {
-	adminPasswordHash, err := hashPassword("password")
+	adminPasswordHash, err := HashPassword("password")
 	if err != nil {
 		panic(err)
 	}
