@@ -255,7 +255,7 @@ ensure_config() {
   "admin_password": "${password}",
   "openvpn_config": "",
   "openvpn_auth": "${DATA_DIR}/vpngate_auth.txt",
-  "auto_connect": true,
+  "auto_connect": false,
   "refresh_seconds": 960,
   "routing_mode": "auto",
   "force_country": "",

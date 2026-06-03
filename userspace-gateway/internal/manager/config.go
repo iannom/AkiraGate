@@ -44,7 +44,7 @@ func DefaultConfig() Config {
 		SecretPath:        randomHex(6),
 		AdminUsername:     "admin",
 		AdminPasswordHash: adminPasswordHash,
-		AutoConnect:       true,
+		AutoConnect:       false,
 		RefreshSeconds:    960,
 		RoutingMode:       "auto",
 		SocksListeners: []gatewayconfig.Listener{
@@ -72,7 +72,9 @@ func LoadConfig(path string) (Config, error) {
 	if err := json.Unmarshal(data, &config); err != nil {
 		return Config{}, err
 	}
-	needsMigration := strings.TrimSpace(config.AdminPassword) != "" || strings.TrimSpace(config.AdminPasswordHash) == ""
+	needsMigration := strings.TrimSpace(config.AdminPassword) != "" ||
+		strings.TrimSpace(config.AdminPasswordHash) == "" ||
+		(config.AutoConnect && strings.TrimSpace(config.OpenVPNConfig) == "" && !hasListenerBackendPolicy(config.SocksListeners))
 	normalizeConfig(&config)
 	if err := ValidateConfig(config); err != nil {
 		return Config{}, err
@@ -239,7 +241,48 @@ func normalizeConfig(config *Config) {
 		}
 		listener.Username = strings.TrimSpace(listener.Username)
 		listener.Password = strings.TrimSpace(listener.Password)
+		listener.CountryCode = strings.ToUpper(strings.TrimSpace(listener.CountryCode))
+		listener.FixedNodeID = strings.TrimSpace(listener.FixedNodeID)
+		listener.EntryCIDRs = normalizeCIDRs(listener.EntryCIDRs)
 	}
+	if config.OpenVPNConfig == "" && !hasListenerBackendPolicy(config.SocksListeners) {
+		config.AutoConnect = false
+	}
+}
+
+func hasListenerBackendPolicy(listeners []gatewayconfig.Listener) bool {
+	for _, listener := range listeners {
+		if strings.TrimSpace(listener.CountryCode) != "" ||
+			strings.TrimSpace(listener.FixedNodeID) != "" {
+			return true
+		}
+		for _, cidr := range listener.EntryCIDRs {
+			if strings.TrimSpace(cidr) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func normalizeCIDRs(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	normalized := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		cidr := strings.TrimSpace(value)
+		if cidr == "" {
+			continue
+		}
+		if _, ok := seen[cidr]; ok {
+			continue
+		}
+		seen[cidr] = struct{}{}
+		normalized = append(normalized, cidr)
+	}
+	return normalized
 }
 
 func hashPassword(password string) (string, error) {

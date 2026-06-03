@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
+  CircleX,
   CheckSquare,
   LogOut,
   CirclePlus,
@@ -24,6 +25,10 @@ import {
   Zap,
 } from "lucide-react";
 import "./styles.css";
+import flagJpUrl from "./assets/flags/jp.svg";
+import flagRoUrl from "./assets/flags/ro.svg";
+import flagThUrl from "./assets/flags/th.svg";
+import flagTwUrl from "./assets/flags/tw.svg";
 
 class AuthError extends Error {}
 
@@ -34,6 +39,59 @@ const pages = [
   { id: "settings", label: "设置", icon: Shield },
   { id: "runtime", label: "运行", icon: SquareTerminal },
 ];
+const defaultPageID = "overview";
+const activePageStorageKey = "akiragate.activePage";
+const pageIDs = new Set(pages.map((page) => page.id));
+
+function isKnownPageID(pageID) {
+  return pageIDs.has(String(pageID || ""));
+}
+
+function getPageStorage() {
+  try {
+    if (typeof window === "undefined") {
+      return null;
+    }
+    return window.localStorage || null;
+  } catch (error) {
+    console.warn("访问当前页面状态存储失败。", error);
+    return null;
+  }
+}
+
+function readStoredActivePage() {
+  const storage = getPageStorage();
+  if (!storage) {
+    return defaultPageID;
+  }
+  try {
+    const storedPage = storage.getItem(activePageStorageKey);
+    if (isKnownPageID(storedPage)) {
+      return storedPage;
+    }
+    if (storedPage) {
+      storage.removeItem(activePageStorageKey);
+    }
+  } catch (error) {
+    console.warn("读取当前页面状态失败，将使用默认首页。", error);
+  }
+  return defaultPageID;
+}
+
+function persistActivePage(pageID) {
+  if (!isKnownPageID(pageID)) {
+    return;
+  }
+  const storage = getPageStorage();
+  if (!storage) {
+    return;
+  }
+  try {
+    storage.setItem(activePageStorageKey, pageID);
+  } catch (error) {
+    console.warn("保存当前页面状态失败。", error);
+  }
+}
 
 const emptyForm = {
   web_host: "::",
@@ -43,7 +101,7 @@ const emptyForm = {
   admin_password: "",
   openvpn_config: "",
   openvpn_auth: "",
-  auto_connect: true,
+  auto_connect: false,
   refresh_seconds: 960,
   routing_mode: "auto",
   force_country: "",
@@ -59,6 +117,60 @@ const ipTypeOptions = [
   ["proxy", "代理/VPN"],
   ["datacenter", "数据中心"],
 ];
+
+const localFlagUrls = Object.freeze({
+  jp: flagJpUrl,
+  ro: flagRoUrl,
+  th: flagThUrl,
+  tw: flagTwUrl,
+});
+
+function normalizeCountryCode(code) {
+  const normalized = String(code || "").trim().toLowerCase();
+  return /^[a-z]{2}$/.test(normalized) ? normalized : "";
+}
+
+function countryCodeToFlagEmoji(normalizedCode) {
+  return normalizedCode
+    .toUpperCase()
+    .split("")
+    .map((letter) => String.fromCodePoint(0x1f1e6 + letter.charCodeAt(0) - 65))
+    .join("");
+}
+
+function formatFlagFallbackText(code) {
+  const fallback = String(code || "--").trim().slice(0, 2).toUpperCase();
+  return fallback || "--";
+}
+
+function isNodeTestAction(actionName) {
+  const name = String(actionName || "");
+  return name === "test-nodes" || (name.startsWith("test-") && name !== "test-proxy");
+}
+
+function mergeNodeResults(state, nodeResults) {
+  const results = Array.isArray(nodeResults) ? nodeResults : [nodeResults];
+  const updates = new Map();
+  for (const node of results) {
+    if (node?.id) {
+      updates.set(node.id, node);
+    }
+  }
+  if (!state || !Array.isArray(state.nodes) || updates.size === 0) {
+    return state;
+  }
+
+  let changed = false;
+  const nodes = state.nodes.map((node) => {
+    const update = updates.get(node.id);
+    if (!update) {
+      return node;
+    }
+    changed = true;
+    return { ...node, ...update };
+  });
+  return changed ? { ...state, nodes } : state;
+}
 
 async function api(path, options = {}) {
   const response = await fetch(`./api/${path}`, {
@@ -92,7 +204,7 @@ function stateToForm(state) {
     admin_password: "",
     openvpn_config: state.openvpn_config || "",
     openvpn_auth: state.openvpn_auth || "",
-    auto_connect: state.auto_connect !== false,
+    auto_connect: Boolean(state.auto_connect),
     refresh_seconds: state.refresh_seconds || 960,
     routing_mode: state.routing_mode || "auto",
     force_country: state.force_country || "",
@@ -108,6 +220,9 @@ function defaultListener(index) {
     username: "",
     password: "",
     enabled: true,
+    country_code: "",
+    entry_cidrs: [],
+    fixed_node_id: "",
   };
 }
 
@@ -119,7 +234,17 @@ function normalizeListener(listener, index) {
     username: listener?.username || "",
     password: listener?.password || "",
     enabled: listener?.enabled !== false,
+    country_code: listener?.country_code || "",
+    entry_cidrs: Array.isArray(listener?.entry_cidrs) ? listener.entry_cidrs : [],
+    fixed_node_id: listener?.fixed_node_id || "",
   };
+}
+
+function parseCIDRInput(value) {
+  return String(value || "")
+    .split(/[\n,]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
 }
 
 function apiBaseFromConfig(config) {
@@ -146,7 +271,9 @@ function App() {
   const [actionMsg, setActionMsg] = useState("");
   const [saveMsg, setSaveMsg] = useState("");
   const [busyAction, setBusyAction] = useState("");
-  const [activePage, setActivePage] = useState("overview");
+  const [batchTestActive, setBatchTestActive] = useState(false);
+  const [batchCancelPending, setBatchCancelPending] = useState(false);
+  const [activePage, setActivePage] = useState(() => readStoredActivePage());
 
   const connected = Boolean(current?.connected);
   const runtimeWeb = `${current?.runtime_web_host || current?.web_host || "::"}:${current?.runtime_web_port || current?.web_port || 8787}`;
@@ -201,6 +328,10 @@ function App() {
     }
   }, [handleAuthError]);
 
+  const mergeNodeResultsIntoCurrent = useCallback((nodeResults) => {
+    setCurrent((previous) => mergeNodeResults(previous, nodeResults));
+  }, []);
+
   const runAction = useCallback(
     async (name, pendingMessage, action, doneMessage) => {
       setBusyAction(name);
@@ -236,6 +367,10 @@ function App() {
   }, []);
 
   useEffect(() => {
+    persistActivePage(activePage);
+  }, [activePage]);
+
+  useEffect(() => {
     if (!auth.authenticated) {
       return;
     }
@@ -260,6 +395,26 @@ function App() {
     }, 5000);
     return () => window.clearInterval(timer);
   }, [loadGatewayStatus, loadLogs, loadState]);
+
+  useEffect(() => {
+    if (!auth.authenticated || (!isNodeTestAction(busyAction) && !batchTestActive)) {
+      return undefined;
+    }
+    let cancelled = false;
+    const refreshNodeState = () => {
+      loadState().catch((error) => {
+        if (!cancelled && !handleAuthError(error)) {
+          setActionMsg(error.message);
+        }
+      });
+    };
+    refreshNodeState();
+    const timer = window.setInterval(refreshNodeState, 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [auth.authenticated, batchTestActive, busyAction, handleAuthError, loadState]);
 
   const login = async (event) => {
     event.preventDefault();
@@ -341,6 +496,11 @@ function App() {
         username: String(listener.username || "").trim(),
         password: String(listener.password || "").trim(),
         enabled: listener.enabled !== false,
+        country_code: String(listener.country_code || "").trim().toUpperCase(),
+        entry_cidrs: Array.isArray(listener.entry_cidrs)
+          ? listener.entry_cidrs.map((value) => String(value || "").trim()).filter(Boolean)
+          : parseCIDRInput(listener.entry_cidrs),
+        fixed_node_id: String(listener.fixed_node_id || "").trim(),
       })),
     }),
     [form, listeners],
@@ -406,17 +566,56 @@ function App() {
     runAction(
       `test-${nodeID}`,
       "正在测试节点...",
-      () => api("test_node", { method: "POST", body: JSON.stringify({ node_id: nodeID }) }),
+      async () => {
+        const result = await api("test_node", { method: "POST", body: JSON.stringify({ node_id: nodeID }) });
+        mergeNodeResultsIntoCurrent(result.node);
+        return result;
+      },
       (result) => `节点测试完成: ${result.node?.probe_status || "unknown"}`,
     );
 
-  const testNodes = (nodeIDs) =>
-    runAction(
-      "test-nodes",
-      "正在批量测试节点真实出口...",
-      () => api("test_nodes", { method: "POST", body: JSON.stringify({ node_ids: nodeIDs }) }),
-      (result) => `批量测试完成: ${(result.nodes || []).length} 个节点返回结果`,
-    );
+  const testNodes = async (nodeIDs) => {
+    setBusyAction("test-nodes");
+    setBatchTestActive(true);
+    setBatchCancelPending(false);
+    setActionMsg("正在批量测试节点真实出口...");
+    try {
+      const result = await api("test_nodes", { method: "POST", body: JSON.stringify({ node_ids: nodeIDs }) });
+      mergeNodeResultsIntoCurrent(result.nodes || []);
+      setActionMsg(
+        result.cancelled
+          ? `批量测试已取消: ${(result.nodes || []).length} 个节点返回结果`
+          : `批量测试完成: ${(result.nodes || []).length} 个节点返回结果`,
+      );
+      await loadState();
+    } catch (error) {
+      if (!handleAuthError(error)) {
+        setActionMsg(error.message);
+      }
+    } finally {
+      setBusyAction("");
+      setBatchTestActive(false);
+      setBatchCancelPending(false);
+    }
+  };
+
+  const cancelTestNodes = async () => {
+    if (!batchTestActive || batchCancelPending) {
+      return;
+    }
+    setBatchCancelPending(true);
+    setActionMsg("正在取消批量测试...");
+    try {
+      const result = await api("cancel_test_nodes", { method: "POST" });
+      setActionMsg(result.message || "已请求取消批量测试");
+      await loadState();
+    } catch (error) {
+      if (!handleAuthError(error)) {
+        setActionMsg(error.message);
+      }
+      setBatchCancelPending(false);
+    }
+  };
 
   const disconnect = () =>
     runAction(
@@ -519,10 +718,13 @@ function App() {
         <NodesPage
           current={current}
           busyAction={busyAction}
+          batchTestActive={batchTestActive}
+          batchCancelPending={batchCancelPending}
           actionMsg={actionMsg}
           onRefreshNodes={refreshNodes}
           onTest={testNode}
           onTestBatch={testNodes}
+          onCancelBatchTest={cancelTestNodes}
           onConnect={connectNode}
         />
       ) : null}
@@ -586,8 +788,22 @@ function OverviewPage({ current, runtimeWeb, restartHint, actionMsg, busyAction,
   );
 }
 
-function NodesPage({ current, busyAction, actionMsg, onRefreshNodes, onTest, onTestBatch, onConnect }) {
+function NodesPage({
+  current,
+  busyAction,
+  batchTestActive,
+  batchCancelPending,
+  actionMsg,
+  onRefreshNodes,
+  onTest,
+  onTestBatch,
+  onCancelBatchTest,
+  onConnect,
+}) {
   const nodes = current?.nodes || [];
+  const batchTesting = Boolean(batchTestActive);
+  const cancellingBatchTest = Boolean(batchCancelPending);
+  const batchActionActive = batchTesting || cancellingBatchTest;
   const [filters, setFilters] = useState({ keyword: "", country: "", ipType: "" });
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(25);
@@ -654,12 +870,18 @@ function NodesPage({ current, busyAction, actionMsg, onRefreshNodes, onTest, onT
   };
 
   const toggleNode = (nodeID) => {
+    if (batchActionActive) {
+      return;
+    }
     setSelectedIDs((previous) =>
       previous.includes(nodeID) ? previous.filter((id) => id !== nodeID) : [...previous, nodeID],
     );
   };
 
   const togglePage = () => {
+    if (batchActionActive) {
+      return;
+    }
     if (selectedOnPage.length === pageNodeIDs.length) {
       setSelectedIDs((previous) => previous.filter((id) => !pageNodeIDs.includes(id)));
       return;
@@ -668,6 +890,9 @@ function NodesPage({ current, busyAction, actionMsg, onRefreshNodes, onTest, onT
   };
 
   const runBatchTest = () => {
+    if (batchActionActive) {
+      return;
+    }
     const ids = selectedIDs.length ? selectedIDs : pageNodeIDs;
     if (!ids.length) {
       return;
@@ -709,15 +934,19 @@ function NodesPage({ current, busyAction, actionMsg, onRefreshNodes, onTest, onT
       </div>
       <div className="page-actions split-actions">
         <div className="actions">
-          <ActionButton icon={CheckSquare} label={selectedOnPage.length === pageNodeIDs.length && pageNodeIDs.length ? "取消本页" : "选择本页"} compact disabled={!pageNodeIDs.length} onClick={togglePage} />
-          <ActionButton icon={Zap} label={selectedIDs.length ? `批量真测 ${selectedIDs.length}` : `真测本页 ${pageNodeIDs.length}`} compact busy={busyAction === "test-nodes"} disabled={!selectedIDs.length && !pageNodeIDs.length} onClick={runBatchTest} />
+          <ActionButton icon={CheckSquare} label={selectedOnPage.length === pageNodeIDs.length && pageNodeIDs.length ? "取消本页" : "选择本页"} compact disabled={!pageNodeIDs.length || batchActionActive} onClick={togglePage} />
+          <ActionButton icon={Zap} label={batchTesting ? "批量真测中" : selectedIDs.length ? `批量真测 ${selectedIDs.length}` : `真测本页 ${pageNodeIDs.length}`} compact busy={batchTesting} disabled={batchActionActive || (!selectedIDs.length && !pageNodeIDs.length)} onClick={runBatchTest} />
+          {batchActionActive ? (
+            <ActionButton icon={CircleX} label="取消批量测试" compact danger busy={cancellingBatchTest} disabled={!batchTesting || cancellingBatchTest} onClick={onCancelBatchTest} />
+          ) : null}
         </div>
-        <ActionButton icon={ListRestart} label="刷新 VPNGate 节点" busy={busyAction === "refresh-nodes"} onClick={onRefreshNodes} />
+        <ActionButton icon={ListRestart} label="刷新 VPNGate 节点" busy={busyAction === "refresh-nodes"} disabled={batchActionActive} onClick={onRefreshNodes} />
       </div>
       <NodeList
         nodes={pageNodes}
         selectedIDs={selectedIDs}
         busyAction={busyAction}
+        batchTesting={batchActionActive}
         onToggle={toggleNode}
         onTest={onTest}
         onConnect={onConnect}
@@ -761,7 +990,7 @@ function SettingsPage({ form, saveMsg, busyAction, onUpdateForm, onSave }) {
         <TextInput label="管理密码" type="password" value={form.admin_password} onChange={(value) => onUpdateForm("admin_password", value)} placeholder="留空表示不修改" autoComplete="new-password" />
         <TextInput label="OpenVPN auth-user-pass 文件" value={form.openvpn_auth} onChange={(value) => onUpdateForm("openvpn_auth", value)} placeholder="/opt/akiragate/vpngate_auth.txt" />
         <SelectInput
-          label="自动连接 VPNGate 节点"
+          label="启动时自动连接 OpenVPN 配置"
           value={String(form.auto_connect)}
           onChange={(value) => onUpdateForm("auto_connect", value === "true")}
           options={[
@@ -925,6 +1154,12 @@ function formatProbeStatus(node) {
   if (status === "not_checked") {
     return "未测试";
   }
+  if (status === "testing") {
+    return "测试中";
+  }
+  if (status === "cancelled") {
+    return "已取消";
+  }
   if (status === "unavailable") {
     return "不可用";
   }
@@ -1032,6 +1267,12 @@ function formatProbeFailureText(message) {
 function formatExitQualityText(node) {
   const info = node.exit_ip_info;
   if (!info) {
+    if (node.probe_status === "testing") {
+      return "正在测试节点真实出口";
+    }
+    if (node.probe_status === "cancelled") {
+      return "批量测试已取消";
+    }
     if (node.probe_status === "unavailable") {
       return formatProbeFailureText(node.probe_message);
     }
@@ -1051,7 +1292,7 @@ function formatExitQualityText(node) {
     .join(" / ");
 }
 
-function NodeList({ nodes, selectedIDs, busyAction, onToggle, onTest, onConnect }) {
+function NodeList({ nodes, selectedIDs, busyAction, batchTesting, onToggle, onTest, onConnect }) {
   if (!nodes.length) {
     return <div className="readout">暂无匹配节点。</div>;
   }
@@ -1066,12 +1307,14 @@ function NodeList({ nodes, selectedIDs, busyAction, onToggle, onTest, onConnect 
         <span>操作</span>
       </div>
       {nodes.map((node) => {
+        const nodeTesting = node.probe_status === "testing";
         return (
-          <div className="node-row" key={node.id || `${node.remote_host}-${node.remote_port}`}>
+          <div className={`node-row ${nodeTesting ? "testing" : ""}`} key={node.id || `${node.remote_host}-${node.remote_port}`}>
             <label className="node-check">
               <input
                 type="checkbox"
                 checked={selectedIDs.includes(node.id)}
+                disabled={batchTesting}
                 onChange={() => onToggle(node.id)}
                 aria-label={`选择节点 ${node.id || node.remote_host || ""}`}
               />
@@ -1085,8 +1328,8 @@ function NodeList({ nodes, selectedIDs, busyAction, onToggle, onTest, onConnect 
             <div className="node-cell muted">{formatProbeStatus(node)}</div>
             <ExitTestInfo node={node} />
             <div className="row-actions">
-              <ActionButton icon={Zap} label="测试" compact busy={busyAction === `test-${node.id}`} onClick={() => onTest(node.id)} />
-              <ActionButton icon={Play} label="连接" compact busy={busyAction === `connect-${node.id}`} onClick={() => onConnect(node.id)} />
+              <ActionButton icon={Zap} label={nodeTesting ? "测试中" : "测试"} compact busy={busyAction === `test-${node.id}` || nodeTesting} disabled={batchTesting || nodeTesting} onClick={() => onTest(node.id)} />
+              <ActionButton icon={Play} label="连接" compact busy={busyAction === `connect-${node.id}`} disabled={batchTesting} onClick={() => onConnect(node.id)} />
             </div>
           </div>
         );
@@ -1096,17 +1339,38 @@ function NodeList({ nodes, selectedIDs, busyAction, onToggle, onTest, onConnect 
 }
 
 function CountryFlag({ code, label }) {
-  const normalized = String(code || "").trim().toLowerCase();
-  if (!/^[a-z]{2}$/.test(normalized)) {
-    return <span className="flag-fallback">{String(code || "--").slice(0, 2).toUpperCase()}</span>;
+  const normalized = normalizeCountryCode(code);
+  const accessibleLabel = label || (normalized ? normalized.toUpperCase() : "flag");
+  const [failedCode, setFailedCode] = useState("");
+
+  useEffect(() => {
+    setFailedCode("");
+  }, [normalized]);
+
+  if (!normalized) {
+    return (
+      <span className="flag-fallback" title={accessibleLabel}>
+        {formatFlagFallbackText(code)}
+      </span>
+    );
   }
+
+  const localFlagUrl = localFlagUrls[normalized];
+  if (!localFlagUrl || failedCode === normalized) {
+    return (
+      <span className="country-flag country-flag-emoji" role="img" aria-label={accessibleLabel} title={accessibleLabel}>
+        {countryCodeToFlagEmoji(normalized)}
+      </span>
+    );
+  }
+
   return (
     <img
       className="country-flag"
-      src={`https://flagcdn.com/${normalized}.svg`}
-      alt={label || code || "flag"}
+      src={localFlagUrl}
+      alt={accessibleLabel}
       loading="lazy"
-      referrerPolicy="no-referrer"
+      onError={() => setFailedCode(normalized)}
     />
   );
 }
@@ -1189,6 +1453,9 @@ function ListenerEditor({ listeners, onUpdate, onRemove }) {
             <TextInput label="监听端口" type="number" min="1024" max="65535" value={listener.port} onChange={(value) => onUpdate(index, "port", value)} />
             <TextInput label="SOCKS5 用户名" value={listener.username} onChange={(value) => onUpdate(index, "username", value)} autoComplete="off" placeholder="留空则无鉴权" />
             <TextInput label="SOCKS5 密码" type="password" value={listener.password} onChange={(value) => onUpdate(index, "password", value)} autoComplete="new-password" placeholder="公网监听必须填写" />
+            <TextInput label="绑定国家代码" value={listener.country_code} onChange={(value) => onUpdate(index, "country_code", value)} placeholder="JP" />
+            <TextInput label="绑定入口网段" value={(listener.entry_cidrs || []).join("\n")} onChange={(value) => onUpdate(index, "entry_cidrs", parseCIDRInput(value))} placeholder="203.0.113.0/24" />
+            <TextInput label="绑定节点 ID" value={listener.fixed_node_id} onChange={(value) => onUpdate(index, "fixed_node_id", value)} placeholder="可选，优先级最高" />
           </div>
         </div>
       ))}

@@ -30,7 +30,16 @@ type Info struct {
 	IPv6    string
 }
 
-func Start(ctx context.Context, options StartOptions) (*Tunnel, error) {
+func Start(ctx context.Context, options StartOptions) (result *Tunnel, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if options.Logger == nil {
+				options.Logger = slog.Default()
+			}
+			options.Logger.Error("OpenVPN 配置解析发生 panic", "panic", recovered)
+			err = fmt.Errorf("解析 OpenVPN 配置失败: %v", recovered)
+		}
+	}()
 	if options.Logger == nil {
 		options.Logger = slog.Default()
 	}

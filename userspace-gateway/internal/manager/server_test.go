@@ -2,6 +2,7 @@ package manager
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -337,7 +338,10 @@ func TestTestNodesWithEmptyList(t *testing.T) {
 func TestProbeNodesConcurrentlyReturnsFailedNodes(t *testing.T) {
 	server := testServer(t)
 
-	nodes := server.probeNodesConcurrently([]string{"missing-a", "missing-b"})
+	nodes, cancelled := server.probeNodesConcurrently(context.Background(), []string{"missing-a", "missing-b"})
+	if cancelled {
+		t.Fatal("未取消的批量测试不应返回 cancelled=true")
+	}
 
 	if len(nodes) != 2 {
 		t.Fatalf("批量测试应返回所有节点结果，实际: %d", len(nodes))
@@ -346,6 +350,122 @@ func TestProbeNodesConcurrentlyReturnsFailedNodes(t *testing.T) {
 		if node.ProbeStatus != "unavailable" || node.ProbeMessage == "" {
 			t.Fatalf("失败节点应返回 unavailable 和错误信息: %+v", node)
 		}
+	}
+}
+
+func TestBatchNodeTestLifecycleRejectsConcurrentBatch(t *testing.T) {
+	server := testServer(t)
+
+	_, batch, ok := server.startBatchNodeTest()
+	if !ok {
+		t.Fatal("首次批量测试应能启动")
+	}
+	if _, _, ok := server.startBatchNodeTest(); ok {
+		t.Fatal("已有批量测试时不应允许再次启动")
+	}
+
+	server.finishBatchNodeTest(batch)
+	if _, batch, ok := server.startBatchNodeTest(); !ok {
+		t.Fatal("批量测试结束后应允许再次启动")
+	} else {
+		server.finishBatchNodeTest(batch)
+	}
+}
+
+func TestCancelTestNodesAPI(t *testing.T) {
+	server := testServer(t)
+	_, batch, ok := server.startBatchNodeTest()
+	if !ok {
+		t.Fatal("测试前置批量任务启动失败")
+	}
+	defer server.finishBatchNodeTest(batch)
+
+	req := httptest.NewRequest(http.MethodPost, "/secret/api/cancel_test_nodes", nil)
+	addLoginCookie(t, server, req)
+	rec := httptest.NewRecorder()
+
+	server.route(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("取消批量测试应返回 200，实际: %d", rec.Code)
+	}
+	var payload struct {
+		Cancelled bool `json:"cancelled"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("取消批量测试响应不是有效 JSON: %v", err)
+	}
+	if !payload.Cancelled {
+		t.Fatal("取消已有批量测试时应返回 cancelled=true")
+	}
+}
+
+func TestProbeNodesConcurrentlyMarksCancelledNodes(t *testing.T) {
+	server := testServer(t)
+	server.nodes = []vpngate.Node{{
+		ID:           "node-a",
+		ProbeStatus:  "not_checked",
+		ProbeMessage: "",
+	}, {
+		ID:           "node-b",
+		ProbeStatus:  "not_checked",
+		ProbeMessage: "",
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	nodes, cancelled := server.probeNodesConcurrently(ctx, []string{"node-a", "node-b"})
+	if !cancelled {
+		t.Fatal("已取消的批量测试应返回 cancelled=true")
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("已取消的批量测试应返回所有节点状态，实际: %d", len(nodes))
+	}
+	for _, node := range nodes {
+		if node.ProbeStatus != "cancelled" || node.ProbeMessage != "批量测试已取消" {
+			t.Fatalf("取消节点应标记为 cancelled: %+v", node)
+		}
+	}
+}
+
+func TestMarkNodeProbeTestingUpdatesState(t *testing.T) {
+	server := testServer(t)
+	server.nodes = []vpngate.Node{{
+		ID:           "node-a",
+		ProbeStatus:  "unavailable",
+		ProbeMessage: "previous failure",
+		ProbeLatency: 1200,
+		ExitIPInfo:   &vpngate.IPInfo{IP: "198.51.100.10"},
+	}}
+	server.failed["node-a"] = "previous failure"
+
+	node, _, ok := server.markNodeProbeTesting("node-a")
+	if !ok {
+		t.Fatal("已存在节点应能进入测试中状态")
+	}
+	if node.ProbeStatus != probeStatusTesting {
+		t.Fatalf("节点应立即标记为测试中，实际: %q", node.ProbeStatus)
+	}
+
+	state := server.state()
+	if len(state.Nodes) != 1 {
+		t.Fatalf("状态接口应返回测试节点，实际数量: %d", len(state.Nodes))
+	}
+	testingNode := state.Nodes[0]
+	if testingNode.ProbeStatus != probeStatusTesting {
+		t.Fatalf("状态接口应暴露测试中状态，实际: %q", testingNode.ProbeStatus)
+	}
+	if testingNode.ProbeMessage == "" {
+		t.Fatal("测试中状态应包含可读提示")
+	}
+	if testingNode.ProbeLatency != 0 {
+		t.Fatalf("重新测试时应清空旧延迟，实际: %d", testingNode.ProbeLatency)
+	}
+	if testingNode.ExitIPInfo != nil {
+		t.Fatalf("重新测试时应清空旧出口信息: %+v", testingNode.ExitIPInfo)
+	}
+	if _, failed := state.FailedNodes["node-a"]; failed {
+		t.Fatal("重新测试中的节点不应继续留在失败列表")
 	}
 }
 
@@ -361,6 +481,33 @@ func TestLocalProxyURLsEscapesCredentials(t *testing.T) {
 	}
 	if values[0] != "socks5h://proxy%20user:p%40ss%3Aword@127.0.0.1:7928" {
 		t.Fatalf("代理 URL 编码不符合预期: %s", values[0])
+	}
+}
+
+func TestProxyURLForListenerUsesLoopbackForUnspecifiedAddress(t *testing.T) {
+	listener := gatewayconfig.NewListener("public", "::", 7928, true)
+
+	value := proxyURLForListener(listener, "[::]:7928")
+
+	if value != "socks5h://[::1]:7928" {
+		t.Fatalf("未指定监听地址的健康检查代理应使用本机回环地址，实际: %s", value)
+	}
+}
+
+func TestTryAutoConnectSkipsVPNGateNodesWithoutConfiguredOpenVPN(t *testing.T) {
+	config := testConfig()
+	config.AutoConnect = true
+	config.OpenVPNConfig = ""
+	server := NewServer(filepath.Join(t.TempDir(), "config.json"), config, nil)
+	server.nodes = []vpngate.Node{{
+		ID:         "jp-1",
+		ConfigText: "client\nremote 203.0.113.10 1194\n",
+	}}
+
+	server.tryAutoConnect()
+
+	if server.session != nil {
+		t.Fatal("没有监听器绑定策略时，启动自动连接不应使用 VPNGate 节点生成临时 OpenVPN 配置")
 	}
 }
 
@@ -406,6 +553,60 @@ func TestSelectNodeIDSkipsFailedNodes(t *testing.T) {
 	config.ForceCountry = "JP"
 	if got := selectNodeID(config, nodes, failed); got != "jp-2" {
 		t.Fatalf("固定国家模式应跳过失败节点，实际: %s", got)
+	}
+}
+
+func TestSelectListenerNodeIDsHonorsListenerPolicy(t *testing.T) {
+	nodes := []vpngate.Node{
+		{ID: "jp-1", CountryShort: "JP", RemoteHost: "203.0.113.10", IP: "198.51.100.10"},
+		{ID: "jp-2", CountryShort: "JP", RemoteHost: "203.0.114.10", IP: "198.51.100.11"},
+		{ID: "us-1", CountryShort: "US", RemoteHost: "192.0.2.10", IP: "192.0.2.10"},
+	}
+	listener := gatewayconfig.NewListener("local", "127.0.0.1", 7928, true)
+	listener.CountryCode = "JP"
+	listener.EntryCIDRs = []string{"203.0.113.0/24"}
+
+	ids, err := selectListenerNodeIDs(testConfig(), listener, nodes, nil, 10)
+	if err != nil {
+		t.Fatalf("监听器策略选择失败: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != "jp-1" {
+		t.Fatalf("监听器策略应按国家和入口 CIDR 过滤节点，实际: %+v", ids)
+	}
+}
+
+func TestSelectListenerNodeIDsUsesVPNGateIPWhenRemoteHostIsDomain(t *testing.T) {
+	nodes := []vpngate.Node{
+		{ID: "jp-1", CountryShort: "JP", RemoteHost: "vpn.example.test", IP: "203.0.113.20"},
+	}
+	listener := gatewayconfig.NewListener("local", "127.0.0.1", 7928, true)
+	listener.EntryCIDRs = []string{"203.0.113.0/24"}
+
+	ids, err := selectListenerNodeIDs(testConfig(), listener, nodes, nil, 10)
+	if err != nil {
+		t.Fatalf("监听器策略选择失败: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != "jp-1" {
+		t.Fatalf("remote_host 为域名时应回退使用 VPNGate 入口 IP，实际: %+v", ids)
+	}
+}
+
+func TestSelectListenerNodeIDsPrefersListenerFixedNode(t *testing.T) {
+	nodes := []vpngate.Node{
+		{ID: "jp-1", CountryShort: "JP", RemoteHost: "203.0.113.10"},
+		{ID: "jp-2", CountryShort: "US", RemoteHost: "192.0.2.20"},
+	}
+	listener := gatewayconfig.NewListener("local", "127.0.0.1", 7928, true)
+	listener.CountryCode = "JP"
+	listener.EntryCIDRs = []string{"203.0.113.0/24"}
+	listener.FixedNodeID = "jp-2"
+
+	ids, err := selectListenerNodeIDs(testConfig(), listener, nodes, nil, 10)
+	if err != nil {
+		t.Fatalf("监听器策略选择失败: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != "jp-2" {
+		t.Fatalf("监听器固定节点应优先生效，实际: %+v", ids)
 	}
 }
 

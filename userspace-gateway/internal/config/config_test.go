@@ -39,3 +39,28 @@ func TestValidateListenersTreatsMissingEnabledAsEnabled(t *testing.T) {
 		t.Fatal("省略 enabled 的公网监听仍应按启用处理并要求鉴权")
 	}
 }
+
+func TestValidateListenersRejectsInvalidBackendPolicy(t *testing.T) {
+	listener := NewListener("local", "127.0.0.1", 7928, true)
+	listener.CountryCode = "JPN"
+	if err := ValidateListeners([]Listener{listener}); err == nil {
+		t.Fatal("无效国家代码应被拒绝")
+	}
+
+	listener.CountryCode = "JP"
+	listener.EntryCIDRs = []string{"not-cidr"}
+	if err := ValidateListeners([]Listener{listener}); err == nil {
+		t.Fatal("无效入口 CIDR 应被拒绝")
+	}
+}
+
+func TestValidateListenersAllowsBackendPolicy(t *testing.T) {
+	listener := NewListener("local", "127.0.0.1", 7928, true)
+	listener.CountryCode = "JP"
+	listener.EntryCIDRs = []string{"203.0.113.0/24", "2001:db8::/32"}
+	listener.FixedNodeID = "jp-1"
+
+	if err := ValidateListeners([]Listener{listener}); err != nil {
+		t.Fatalf("有效 SOCKS5 后端绑定策略应通过校验: %v", err)
+	}
+}

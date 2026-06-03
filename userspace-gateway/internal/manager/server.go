@@ -17,6 +17,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -31,8 +32,11 @@ const (
 	sessionCookieName    = "akiragate_session"
 	defaultIPPureInfoURL = "https://my.ippure.com/v1/info"
 	maxBatchNodeTests    = 8
-	maxBatchTestWorkers  = 3
+	maxBatchTestWorkers  = 5
+	batchProbeTimeout    = gatewayconfig.DefaultHandshakeTimeout * 70 / 100
 	exitInfoRequestLimit = 16 * 1024
+	probeStatusTesting   = "testing"
+	healthCheckInterval  = 60 * time.Second
 )
 
 type nodeTestJob struct {
@@ -45,6 +49,24 @@ type nodeTestResult struct {
 	NodeID string
 	Node   vpngate.Node
 	Err    error
+}
+
+type listenerWorkerResult struct {
+	Listener gatewayconfig.Listener
+	Err      error
+}
+
+type listenerBackendPlan struct {
+	ConfigPath   string
+	NodeID       string
+	CountryCode  string
+	EntryIP      string
+	EntryCIDRs   []string
+	StaticConfig bool
+}
+
+type batchNodeTest struct {
+	cancel context.CancelFunc
 }
 
 type Server struct {
@@ -62,6 +84,7 @@ type Server struct {
 	authSessions map[string]authSession
 	nodes        []vpngate.Node
 	failed       map[string]string
+	batchTest    *batchNodeTest
 }
 
 type authSession struct {
@@ -70,13 +93,14 @@ type authSession struct {
 }
 
 type Session struct {
-	startedAt time.Time
-	config    Config
-	cancel    context.CancelFunc
-	status    string
-	message   string
-	socksURLs []string
-	nodeID    string
+	startedAt        time.Time
+	config           Config
+	cancel           context.CancelFunc
+	status           string
+	message          string
+	socksURLs        []string
+	nodeID           string
+	listenerBackends map[string]ListenerBackendState
 }
 
 type GatewayComponent struct {
@@ -84,6 +108,20 @@ type GatewayComponent struct {
 	Status  string `json:"status"`
 	Details string `json:"details"`
 	Error   string `json:"error,omitempty"`
+}
+
+type ListenerBackendState struct {
+	ListenerName  string   `json:"listener_name"`
+	ListenAddress string   `json:"listen_address"`
+	ProxyURL      string   `json:"proxy_url"`
+	Status        string   `json:"status"`
+	Message       string   `json:"message"`
+	NodeID        string   `json:"node_id,omitempty"`
+	CountryCode   string   `json:"country_code,omitempty"`
+	EntryCIDRs    []string `json:"entry_cidrs,omitempty"`
+	EntryIP       string   `json:"entry_ip,omitempty"`
+	ExitIP        string   `json:"exit_ip,omitempty"`
+	Error         string   `json:"error,omitempty"`
 }
 
 type ProxyTestResult struct {
@@ -113,30 +151,32 @@ type AuthState struct {
 }
 
 type State struct {
-	Connected      bool                     `json:"connected"`
-	Status         string                   `json:"status"`
-	Message        string                   `json:"message"`
-	WebHost        string                   `json:"web_host"`
-	WebPort        int                      `json:"web_port"`
-	RuntimeWebHost string                   `json:"runtime_web_host"`
-	RuntimeWebPort int                      `json:"runtime_web_port"`
-	RestartNeeded  bool                     `json:"restart_needed"`
-	SecretPath     string                   `json:"secret_path"`
-	OpenVPNConfig  string                   `json:"openvpn_config"`
-	OpenVPNAuth    string                   `json:"openvpn_auth"`
-	SocksListeners []gatewayconfig.Listener `json:"socks5_listeners"`
-	LocalProxyURLs []string                 `json:"local_proxy_urls"`
-	ConnectedSince string                   `json:"connected_since,omitempty"`
-	AdminUsername  string                   `json:"admin_username"`
-	AdminPassword  string                   `json:"admin_password"`
-	Nodes          []vpngate.Node           `json:"nodes"`
-	ActiveNodeID   string                   `json:"active_node_id,omitempty"`
-	FailedNodes    map[string]string        `json:"failed_nodes,omitempty"`
-	AutoConnect    bool                     `json:"auto_connect"`
-	RefreshSeconds int                      `json:"refresh_seconds"`
-	RoutingMode    string                   `json:"routing_mode"`
-	ForceCountry   string                   `json:"force_country"`
-	FixedNodeID    string                   `json:"fixed_node_id"`
+	Connected        bool                     `json:"connected"`
+	Status           string                   `json:"status"`
+	Message          string                   `json:"message"`
+	WebHost          string                   `json:"web_host"`
+	WebPort          int                      `json:"web_port"`
+	RuntimeWebHost   string                   `json:"runtime_web_host"`
+	RuntimeWebPort   int                      `json:"runtime_web_port"`
+	RestartNeeded    bool                     `json:"restart_needed"`
+	SecretPath       string                   `json:"secret_path"`
+	OpenVPNConfig    string                   `json:"openvpn_config"`
+	OpenVPNAuth      string                   `json:"openvpn_auth"`
+	SocksListeners   []gatewayconfig.Listener `json:"socks5_listeners"`
+	LocalProxyURLs   []string                 `json:"local_proxy_urls"`
+	ConnectedSince   string                   `json:"connected_since,omitempty"`
+	AdminUsername    string                   `json:"admin_username"`
+	AdminPassword    string                   `json:"admin_password"`
+	Nodes            []vpngate.Node           `json:"nodes"`
+	ActiveNodeID     string                   `json:"active_node_id,omitempty"`
+	ActiveNodeIDs    []string                 `json:"active_node_ids,omitempty"`
+	ListenerBackends []ListenerBackendState   `json:"listener_backends,omitempty"`
+	FailedNodes      map[string]string        `json:"failed_nodes,omitempty"`
+	AutoConnect      bool                     `json:"auto_connect"`
+	RefreshSeconds   int                      `json:"refresh_seconds"`
+	RoutingMode      string                   `json:"routing_mode"`
+	ForceCountry     string                   `json:"force_country"`
+	FixedNodeID      string                   `json:"fixed_node_id"`
 }
 
 func NewServer(configPath string, config Config, logger *slog.Logger, logBuffer ...*LogBuffer) *Server {
@@ -284,6 +324,11 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.testNodes(w, r)
+	case r.Method == http.MethodPost && path == "/api/cancel_test_nodes":
+		if !s.requireAuth(w, r) {
+			return
+		}
+		s.cancelTestNodes(w)
 	case r.Method == http.MethodPost && path == "/api/disconnect":
 		if !s.requireAuth(w, r) {
 			return
@@ -317,8 +362,29 @@ func (s *Server) gatewayStatus(w http.ResponseWriter) {
 	if session != nil {
 		vpnStatus = session.status
 		vpnDetails = session.message
-		if len(session.socksURLs) > 0 {
+		backends := listenerBackendStates(session.listenerBackends)
+		if len(backends) > 0 {
+			var details []string
+			for _, backend := range backends {
+				item := fmt.Sprintf("%s %s", backend.ListenAddress, backend.Status)
+				if backend.NodeID != "" {
+					item += " node=" + backend.NodeID
+				}
+				if backend.EntryIP != "" {
+					item += " entry=" + backend.EntryIP
+				}
+				if backend.ExitIP != "" {
+					item += " exit=" + backend.ExitIP
+				}
+				if backend.Error != "" {
+					item += " error=" + backend.Error
+				}
+				details = append(details, item)
+			}
 			proxyStatus = "running"
+			proxyDetails = strings.Join(details, "\n")
+		} else if len(session.socksURLs) > 0 {
+			proxyStatus = "starting"
 			proxyDetails = strings.Join(session.socksURLs, "\n")
 		}
 	}
@@ -515,10 +581,12 @@ func (s *Server) state() State {
 	status := "stopped"
 	message := "未连接"
 	connectedSince := ""
+	listenerBackends := []ListenerBackendState{}
 	if s.session != nil {
 		status = s.session.status
 		message = s.session.message
 		connectedSince = s.session.startedAt.Format(time.RFC3339)
+		listenerBackends = listenerBackendStates(s.session.listenerBackends)
 	}
 	nodes := make([]vpngate.Node, len(s.nodes))
 	copy(nodes, s.nodes)
@@ -527,39 +595,44 @@ func (s *Server) state() State {
 		failed[key] = value
 	}
 	activeNodeID := ""
+	activeNodeIDs := []string{}
 	if s.session != nil {
 		for _, node := range nodes {
 			if node.Active {
-				activeNodeID = node.ID
-				break
+				if activeNodeID == "" {
+					activeNodeID = node.ID
+				}
+				activeNodeIDs = append(activeNodeIDs, node.ID)
 			}
 		}
 	}
 	return State{
-		Connected:      connected,
-		Status:         status,
-		Message:        message,
-		WebHost:        s.config.WebHost,
-		WebPort:        s.config.WebPort,
-		RuntimeWebHost: s.listenHost,
-		RuntimeWebPort: s.listenPort,
-		RestartNeeded:  s.webRestartNeededLocked(),
-		SecretPath:     s.config.SecretPath,
-		OpenVPNConfig:  s.config.OpenVPNConfig,
-		OpenVPNAuth:    s.config.OpenVPNAuth,
-		SocksListeners: s.config.SocksListeners,
-		LocalProxyURLs: localProxyURLs(s.config.SocksListeners),
-		ConnectedSince: connectedSince,
-		AdminUsername:  s.config.AdminUsername,
-		AdminPassword:  "",
-		Nodes:          nodes,
-		ActiveNodeID:   activeNodeID,
-		FailedNodes:    failed,
-		AutoConnect:    s.config.AutoConnect,
-		RefreshSeconds: s.config.RefreshSeconds,
-		RoutingMode:    s.config.RoutingMode,
-		ForceCountry:   s.config.ForceCountry,
-		FixedNodeID:    s.config.FixedNodeID,
+		Connected:        connected,
+		Status:           status,
+		Message:          message,
+		WebHost:          s.config.WebHost,
+		WebPort:          s.config.WebPort,
+		RuntimeWebHost:   s.listenHost,
+		RuntimeWebPort:   s.listenPort,
+		RestartNeeded:    s.webRestartNeededLocked(),
+		SecretPath:       s.config.SecretPath,
+		OpenVPNConfig:    s.config.OpenVPNConfig,
+		OpenVPNAuth:      s.config.OpenVPNAuth,
+		SocksListeners:   s.config.SocksListeners,
+		LocalProxyURLs:   localProxyURLs(s.config.SocksListeners),
+		ConnectedSince:   connectedSince,
+		AdminUsername:    s.config.AdminUsername,
+		AdminPassword:    "",
+		Nodes:            nodes,
+		ActiveNodeID:     activeNodeID,
+		ActiveNodeIDs:    activeNodeIDs,
+		ListenerBackends: listenerBackends,
+		FailedNodes:      failed,
+		AutoConnect:      s.config.AutoConnect,
+		RefreshSeconds:   s.config.RefreshSeconds,
+		RoutingMode:      s.config.RoutingMode,
+		ForceCountry:     s.config.ForceCountry,
+		FixedNodeID:      s.config.FixedNodeID,
 	}
 }
 
@@ -568,6 +641,21 @@ func (s *Server) webRestartNeededLocked() bool {
 		return false
 	}
 	return s.config.WebHost != s.listenHost || s.config.WebPort != s.listenPort
+}
+
+func listenerBackendStates(backends map[string]ListenerBackendState) []ListenerBackendState {
+	if len(backends) == 0 {
+		return []ListenerBackendState{}
+	}
+	values := make([]ListenerBackendState, 0, len(backends))
+	for _, backend := range backends {
+		backend.EntryCIDRs = append([]string(nil), backend.EntryCIDRs...)
+		values = append(values, backend)
+	}
+	sort.Slice(values, func(i, j int) bool {
+		return values[i].ListenAddress < values[j].ListenAddress
+	})
+	return values
 }
 
 func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
@@ -647,11 +735,12 @@ func (s *Server) connect(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		if config.OpenVPNConfig == "" {
-			s.mu.Unlock()
-			s.sendError(w, http.StatusBadRequest, "请先设置 OpenVPN 配置文件路径或选择节点")
-			return
-		}
-		if _, err := os.Stat(config.OpenVPNConfig); err != nil {
+			if len(s.nodes) == 0 {
+				s.mu.Unlock()
+				s.sendError(w, http.StatusBadRequest, "请先设置 OpenVPN 配置文件路径、选择节点或刷新 VPNGate 节点")
+				return
+			}
+		} else if _, err := os.Stat(config.OpenVPNConfig); err != nil {
 			s.mu.Unlock()
 			s.sendError(w, http.StatusBadRequest, fmt.Sprintf("OpenVPN 配置不可读: %v", err))
 			return
@@ -659,54 +748,19 @@ func (s *Server) connect(w http.ResponseWriter, r *http.Request) {
 	}
 	sessionCtx, cancel := context.WithCancel(context.Background())
 	session := &Session{
-		startedAt: time.Now(),
-		config:    config,
-		cancel:    cancel,
-		status:    "starting",
-		message:   "正在启动用户态 OpenVPN 网关",
-		nodeID:    nodeID,
+		startedAt:        time.Now(),
+		config:           config,
+		cancel:           cancel,
+		status:           "starting",
+		message:          "正在启动用户态 OpenVPN 网关",
+		nodeID:           nodeID,
+		listenerBackends: map[string]ListenerBackendState{},
 	}
 	s.session = session
 	s.mu.Unlock()
 
 	go s.runSession(sessionCtx, session)
 	s.sendJSON(w, map[string]any{"ok": true, "message": "连接流程已启动"})
-}
-
-func (s *Server) startNodeSession(nodeID string) error {
-	s.mu.Lock()
-	if s.session != nil {
-		s.mu.Unlock()
-		return errors.New("当前已有活动连接")
-	}
-	node, ok := s.findNodeLocked(nodeID)
-	if !ok {
-		s.mu.Unlock()
-		return errors.New("节点不存在")
-	}
-	config := s.config
-	path, err := s.writeNodeConfig(node)
-	if err != nil {
-		s.mu.Unlock()
-		return err
-	}
-	config.OpenVPNConfig = path
-	for idx := range s.nodes {
-		s.nodes[idx].Active = s.nodes[idx].ID == nodeID
-	}
-	sessionCtx, cancel := context.WithCancel(context.Background())
-	session := &Session{
-		startedAt: time.Now(),
-		config:    config,
-		cancel:    cancel,
-		status:    "starting",
-		message:   "正在自动连接 VPNGate 节点 " + nodeID,
-		nodeID:    nodeID,
-	}
-	s.session = session
-	s.mu.Unlock()
-	go s.runSession(sessionCtx, session)
-	return nil
 }
 
 func (s *Server) refreshNodes(w http.ResponseWriter) {
@@ -716,6 +770,11 @@ func (s *Server) refreshNodes(w http.ResponseWriter) {
 		return
 	}
 	s.mu.Lock()
+	activeIDs := s.activeNodeIDsLocked()
+	for idx := range nodes {
+		_, active := activeIDs[nodes[idx].ID]
+		nodes[idx].Active = active
+	}
 	s.nodes = nodes
 	s.failed = map[string]string{}
 	s.mu.Unlock()
@@ -727,7 +786,10 @@ func (s *Server) testNode(w http.ResponseWriter, r *http.Request) {
 		NodeID string `json:"node_id"`
 		ID     string `json:"id"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&payload)
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil && !errors.Is(err, io.EOF) {
+		s.sendError(w, http.StatusBadRequest, "请求 JSON 无效")
+		return
+	}
 	nodeID := payload.NodeID
 	if nodeID == "" {
 		nodeID = payload.ID
@@ -736,7 +798,7 @@ func (s *Server) testNode(w http.ResponseWriter, r *http.Request) {
 		s.sendError(w, http.StatusBadRequest, "节点 ID 不能为空")
 		return
 	}
-	node, err := s.probeNode(nodeID)
+	node, err := s.probeNode(context.Background(), nodeID)
 	if err != nil {
 		s.sendError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -750,7 +812,10 @@ func (s *Server) testNodes(w http.ResponseWriter, r *http.Request) {
 		IDs     []string `json:"ids"`
 		Limit   int      `json:"limit"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&payload)
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil && !errors.Is(err, io.EOF) {
+		s.sendError(w, http.StatusBadRequest, "请求 JSON 无效")
+		return
+	}
 	nodeIDs := payload.NodeIDs
 	if len(nodeIDs) == 0 {
 		nodeIDs = payload.IDs
@@ -769,13 +834,62 @@ func (s *Server) testNodes(w http.ResponseWriter, r *http.Request) {
 	if len(nodeIDs) > maxBatchNodeTests {
 		nodeIDs = nodeIDs[:maxBatchNodeTests]
 	}
-	results := s.probeNodesConcurrently(nodeIDs)
-	s.sendJSON(w, map[string]any{"ok": true, "nodes": results})
+
+	testCtx, batch, ok := s.startBatchNodeTest()
+	if !ok {
+		s.sendError(w, http.StatusConflict, "已有批量测试正在运行")
+		return
+	}
+	defer s.finishBatchNodeTest(batch)
+
+	s.markBatchNodesProbeTesting(nodeIDs)
+	results, cancelled := s.probeNodesConcurrently(testCtx, nodeIDs)
+	s.sendJSON(w, map[string]any{"ok": true, "cancelled": cancelled, "nodes": results})
 }
 
-func (s *Server) probeNodesConcurrently(nodeIDs []string) []vpngate.Node {
+func (s *Server) cancelTestNodes(w http.ResponseWriter) {
+	if s.cancelBatchNodeTest() {
+		s.sendJSON(w, map[string]any{"ok": true, "cancelled": true, "message": "已请求取消批量测试"})
+		return
+	}
+	s.sendJSON(w, map[string]any{"ok": true, "cancelled": false, "message": "当前没有正在运行的批量测试"})
+}
+
+func (s *Server) startBatchNodeTest() (context.Context, *batchNodeTest, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.batchTest != nil {
+		return nil, nil, false
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	batch := &batchNodeTest{cancel: cancel}
+	s.batchTest = batch
+	return ctx, batch, true
+}
+
+func (s *Server) finishBatchNodeTest(batch *batchNodeTest) {
+	batch.cancel()
+	s.mu.Lock()
+	if s.batchTest == batch {
+		s.batchTest = nil
+	}
+	s.mu.Unlock()
+}
+
+func (s *Server) cancelBatchNodeTest() bool {
+	s.mu.Lock()
+	batch := s.batchTest
+	s.mu.Unlock()
+	if batch == nil {
+		return false
+	}
+	batch.cancel()
+	return true
+}
+
+func (s *Server) probeNodesConcurrently(ctx context.Context, nodeIDs []string) ([]vpngate.Node, bool) {
 	if len(nodeIDs) == 0 {
-		return []vpngate.Node{}
+		return []vpngate.Node{}, false
 	}
 	workerCount := maxBatchTestWorkers
 	if workerCount > len(nodeIDs) {
@@ -783,54 +897,140 @@ func (s *Server) probeNodesConcurrently(nodeIDs []string) []vpngate.Node {
 	}
 	jobs := make(chan nodeTestJob)
 	resultCh := make(chan nodeTestResult, len(nodeIDs))
+	queuedCh := make(chan int, 1)
 
 	for worker := 0; worker < workerCount; worker++ {
 		go func() {
 			for job := range jobs {
-				node, err := s.probeNode(job.NodeID)
+				node, err := s.probeBatchNode(ctx, job.NodeID)
 				resultCh <- nodeTestResult{Index: job.Index, NodeID: job.NodeID, Node: node, Err: err}
 			}
 		}()
 	}
 
 	go func() {
+		queued := 0
+		defer func() {
+			close(jobs)
+			queuedCh <- queued
+		}()
 		for idx, nodeID := range nodeIDs {
-			jobs <- nodeTestJob{Index: idx, NodeID: nodeID}
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- nodeTestJob{Index: idx, NodeID: nodeID}:
+				queued++
+			}
 		}
-		close(jobs)
 	}()
 
 	results := make([]vpngate.Node, len(nodeIDs))
-	for range nodeIDs {
-		result := <-resultCh
-		if result.Err != nil {
-			s.logger.Warn("节点测试失败", "node", result.NodeID, "error", result.Err)
-			result.Node = s.markNodeProbeFailed(result.NodeID, result.Err.Error())
+	completedNodes := make([]bool, len(nodeIDs))
+	expected := len(nodeIDs)
+	completed := 0
+	queuedKnown := false
+	cancelled := false
+	for completed < expected {
+		select {
+		case queued := <-queuedCh:
+			expected = queued
+			queuedKnown = true
+		case <-ctx.Done():
+			cancelled = true
+			if !queuedKnown {
+				expected = <-queuedCh
+				queuedKnown = true
+			}
+			for completed < expected {
+				select {
+				case result := <-resultCh:
+					completed++
+					if result.Err != nil && !errors.Is(result.Err, context.Canceled) {
+						s.logger.Warn("节点测试失败", "node", result.NodeID, "error", result.Err)
+						result.Node = s.markNodeProbeFailed(result.NodeID, result.Err.Error())
+					}
+					if errors.Is(result.Err, context.Canceled) {
+						result.Node = s.markNodeProbeCancelled(result.NodeID)
+					}
+					results[result.Index] = result.Node
+					completedNodes[result.Index] = true
+				}
+			}
+			for idx, nodeID := range nodeIDs {
+				if !completedNodes[idx] {
+					results[idx] = s.markNodeProbeCancelled(nodeID)
+				}
+			}
+			return compactNodeTestResults(results), true
+		case result := <-resultCh:
+			completed++
+			if result.Err != nil && !errors.Is(result.Err, context.Canceled) {
+				s.logger.Warn("节点测试失败", "node", result.NodeID, "error", result.Err)
+				result.Node = s.markNodeProbeFailed(result.NodeID, result.Err.Error())
+			}
+			if errors.Is(result.Err, context.Canceled) {
+				cancelled = true
+				result.Node = s.markNodeProbeCancelled(result.NodeID)
+			}
+			results[result.Index] = result.Node
+			completedNodes[result.Index] = true
 		}
-		results[result.Index] = result.Node
 	}
-	return results
+	if ctx.Err() != nil || cancelled {
+		for idx, nodeID := range nodeIDs {
+			if !completedNodes[idx] {
+				results[idx] = s.markNodeProbeCancelled(nodeID)
+			}
+		}
+		return compactNodeTestResults(results), true
+	}
+	return compactNodeTestResults(results), false
 }
 
-func (s *Server) probeNode(nodeID string) (vpngate.Node, error) {
-	s.mu.Lock()
-	node, ok := s.findNodeLocked(nodeID)
-	config := s.config
-	s.mu.Unlock()
+func compactNodeTestResults(results []vpngate.Node) []vpngate.Node {
+	compacted := make([]vpngate.Node, 0, len(results))
+	for _, node := range results {
+		if node.ID != "" {
+			compacted = append(compacted, node)
+		}
+	}
+	return compacted
+}
+
+func (s *Server) probeNode(ctx context.Context, nodeID string) (vpngate.Node, error) {
+	return s.probeNodeWithTimeout(ctx, nodeID, gatewayconfig.DefaultHandshakeTimeout)
+}
+
+func (s *Server) probeBatchNode(ctx context.Context, nodeID string) (vpngate.Node, error) {
+	return s.probeNodeWithTimeout(ctx, nodeID, batchProbeTimeout)
+}
+
+func (s *Server) probeNodeWithTimeout(ctx context.Context, nodeID string, handshakeTimeout time.Duration) (vpngate.Node, error) {
+	if handshakeTimeout <= 0 {
+		handshakeTimeout = gatewayconfig.DefaultHandshakeTimeout
+	}
+	if err := ctx.Err(); err != nil {
+		return vpngate.Node{}, err
+	}
+	node, config, ok := s.markNodeProbeTesting(nodeID)
 	if !ok {
 		return vpngate.Node{}, errors.New("节点不存在")
 	}
+	if err := ctx.Err(); err != nil {
+		return s.markNodeProbeCancelled(nodeID), err
+	}
 	path, err := s.writeNodeConfig(node)
 	if err != nil {
+		s.markNodeProbeFailed(nodeID, err.Error())
 		return vpngate.Node{}, err
 	}
 	started := time.Now()
-	probeCtx, cancel := context.WithTimeout(context.Background(), gatewayconfig.DefaultHandshakeTimeout)
+	probeCtx, cancel := context.WithTimeout(ctx, handshakeTimeout)
 	defer cancel()
 	tunnel, err := vpn.Start(probeCtx, vpn.StartOptions{
 		ConfigPath:       path,
 		AuthFilePath:     config.OpenVPNAuth,
-		HandshakeTimeout: gatewayconfig.DefaultHandshakeTimeout,
+		HandshakeTimeout: handshakeTimeout,
 		Logger:           s.logger.With("probe_node", nodeID),
 	})
 	status := "available"
@@ -845,6 +1045,9 @@ func (s *Server) probeNode(nodeID string) (vpngate.Node, error) {
 			status = "unavailable"
 			message = err.Error()
 		}
+	}
+	if ctx.Err() != nil {
+		return s.markNodeProbeCancelled(nodeID), ctx.Err()
 	}
 	latency := int(time.Since(started).Milliseconds())
 
@@ -867,6 +1070,69 @@ func (s *Server) probeNode(nodeID string) (vpngate.Node, error) {
 	return vpngate.Node{}, errors.New("节点不存在")
 }
 
+func (s *Server) markNodeProbeTesting(nodeID string) (vpngate.Node, Config, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for idx := range s.nodes {
+		if s.nodes[idx].ID == nodeID {
+			s.nodes[idx].ProbeStatus = probeStatusTesting
+			s.nodes[idx].ProbeMessage = "正在测试节点真实出口"
+			s.nodes[idx].ProbeLatency = 0
+			s.nodes[idx].ExitIPInfo = nil
+			delete(s.failed, nodeID)
+			return s.nodes[idx], s.config, true
+		}
+	}
+	return vpngate.Node{}, s.config, false
+}
+
+func (s *Server) markBatchNodesProbeTesting(nodeIDs []string) {
+	if len(nodeIDs) == 0 {
+		return
+	}
+	selected := make(map[string]struct{}, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		if nodeID != "" {
+			selected[nodeID] = struct{}{}
+		}
+	}
+	if len(selected) == 0 {
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for idx := range s.nodes {
+		if _, ok := selected[s.nodes[idx].ID]; ok {
+			s.nodes[idx].ProbeStatus = probeStatusTesting
+			s.nodes[idx].ProbeMessage = "正在测试节点真实出口"
+			s.nodes[idx].ProbeLatency = 0
+			s.nodes[idx].ExitIPInfo = nil
+			delete(s.failed, s.nodes[idx].ID)
+		}
+	}
+}
+
+func (s *Server) markNodeProbeCancelled(nodeID string) vpngate.Node {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for idx := range s.nodes {
+		if s.nodes[idx].ID == nodeID {
+			s.nodes[idx].ProbeStatus = "cancelled"
+			s.nodes[idx].ProbeMessage = "批量测试已取消"
+			s.nodes[idx].ProbeLatency = 0
+			s.nodes[idx].ExitIPInfo = nil
+			delete(s.failed, nodeID)
+			return s.nodes[idx]
+		}
+	}
+	return vpngate.Node{
+		ID:           nodeID,
+		ProbeStatus:  "cancelled",
+		ProbeMessage: "批量测试已取消",
+	}
+}
+
 func (s *Server) markNodeProbeFailed(nodeID string, message string) vpngate.Node {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -874,6 +1140,7 @@ func (s *Server) markNodeProbeFailed(nodeID string, message string) vpngate.Node
 		if s.nodes[idx].ID == nodeID {
 			s.nodes[idx].ProbeStatus = "unavailable"
 			s.nodes[idx].ProbeMessage = message
+			s.nodes[idx].ProbeLatency = 0
 			s.nodes[idx].ExitIPInfo = nil
 			s.failed[nodeID] = message
 			return s.nodes[idx]
@@ -903,65 +1170,265 @@ func (s *Server) disconnect(w http.ResponseWriter) {
 
 func (s *Server) runSession(ctx context.Context, session *Session) {
 	config := session.config
-	tunnel, err := vpn.Start(ctx, vpn.StartOptions{
-		ConfigPath:       config.OpenVPNConfig,
-		AuthFilePath:     config.OpenVPNAuth,
-		HandshakeTimeout: gatewayconfig.DefaultHandshakeTimeout,
-		Logger:           s.logger,
-	})
-	if err != nil {
-		s.finishSession(session, "error", fmt.Sprintf("启动用户态 OpenVPN 失败: %v", err))
-		return
-	}
-	defer tunnel.Close()
-
-	dialer, err := vpn.NewDialer(ctx, tunnel, s.logger)
-	if err != nil {
-		s.finishSession(session, "error", fmt.Sprintf("初始化用户态 TCP/IP 栈失败: %v", err))
-		return
-	}
-	defer dialer.Close()
-
-	servers := make([]*socks.Server, 0, len(config.SocksListeners))
-	errCh := make(chan error, len(config.SocksListeners))
+	listeners := make([]gatewayconfig.Listener, 0, len(config.SocksListeners))
 	for _, listener := range config.SocksListeners {
 		if !listener.IsEnabled() {
 			continue
 		}
-		server := socks.NewServer(
-			listener.ListenAddress(),
-			dialer,
-			gatewayconfig.DefaultConnectTimeout,
-			s.logger.With("listener", listener.Name),
-			socks.AuthConfig{Username: listener.Username, Password: listener.Password},
-		)
-		servers = append(servers, server)
-		go func() {
-			errCh <- server.Serve(ctx)
-		}()
+		listeners = append(listeners, listener)
 	}
-	if len(servers) == 0 {
+	if len(listeners) == 0 {
 		s.finishSession(session, "error", "没有启用任何 SOCKS5 监听端口")
 		return
 	}
-	s.updateSessionSocksURLs(session, localProxyURLs(config.SocksListeners))
-	defer func() {
-		for _, server := range servers {
-			_ = server.Close()
-		}
-	}()
 
-	s.updateSession(session, "running", "用户态 OpenVPN 已连接，SOCKS5 网关已启动")
+	s.updateSessionSocksURLs(session, localProxyURLs(listeners))
+	s.updateSession(session, "starting", "正在为每个 SOCKS5 入口启动独立 OpenVPN 后端")
+
+	resultCh := make(chan listenerWorkerResult, len(listeners))
+	for _, listener := range listeners {
+		listener := listener
+		s.updateListenerBackendState(session, listener, ListenerBackendState{
+			Status:  "starting",
+			Message: "等待选择 OpenVPN 后端",
+		})
+		go s.runListenerWorker(ctx, session, listener, resultCh)
+	}
+
 	for {
 		select {
 		case <-ctx.Done():
 			s.finishSession(session, "stopped", "已断开")
 			return
-		case err := <-errCh:
-			if err != nil && ctx.Err() == nil {
-				s.finishSession(session, "error", fmt.Sprintf("SOCKS5 网关异常退出: %v", err))
+		case result := <-resultCh:
+			if result.Err != nil && ctx.Err() == nil {
+				s.finishSession(session, "error", fmt.Sprintf("SOCKS5 入口 %s 异常退出: %v", result.Listener.Name, result.Err))
 				return
 			}
+		}
+	}
+}
+
+func (s *Server) runListenerWorker(ctx context.Context, session *Session, listener gatewayconfig.Listener, resultCh chan<- listenerWorkerResult) {
+	forceVPNGate := listenerHasBackendPolicy(listener) || session.config.OpenVPNConfig == ""
+	retry := 0
+	for {
+		if ctx.Err() != nil {
+			resultCh <- listenerWorkerResult{Listener: listener, Err: nil}
+			return
+		}
+
+		s.updateListenerBackendState(session, listener, ListenerBackendState{
+			Status:  "switching",
+			Message: "正在选择并测试 OpenVPN 后端",
+		})
+		plan, err := s.resolveListenerBackend(ctx, session.config, listener, forceVPNGate)
+		if err != nil {
+			s.updateListenerBackendState(session, listener, ListenerBackendState{
+				Status:  "error",
+				Message: "OpenVPN 后端选择失败",
+				Error:   err.Error(),
+			})
+			if !sleepWithContext(ctx, failoverBackoff(retry)) {
+				resultCh <- listenerWorkerResult{Listener: listener, Err: nil}
+				return
+			}
+			retry++
+			continue
+		}
+
+		err = s.serveListenerBackend(ctx, session, listener, plan)
+		if err == nil || ctx.Err() != nil {
+			resultCh <- listenerWorkerResult{Listener: listener, Err: nil}
+			return
+		}
+		if isSocksListenFailure(err) {
+			resultCh <- listenerWorkerResult{Listener: listener, Err: err}
+			return
+		}
+		if plan.NodeID != "" {
+			s.markNodeProbeFailed(plan.NodeID, err.Error())
+		}
+		s.updateListenerBackendState(session, listener, ListenerBackendState{
+			Status:      "switching",
+			Message:     "当前 OpenVPN 后端不可用，正在刷新 VPNGate 节点并切换",
+			NodeID:      plan.NodeID,
+			CountryCode: plan.CountryCode,
+			EntryCIDRs:  plan.EntryCIDRs,
+			EntryIP:     plan.EntryIP,
+			Error:       err.Error(),
+		})
+		s.refreshNodesInBackground()
+		forceVPNGate = true
+		if !sleepWithContext(ctx, failoverBackoff(retry)) {
+			resultCh <- listenerWorkerResult{Listener: listener, Err: nil}
+			return
+		}
+		retry++
+	}
+}
+
+func (s *Server) resolveListenerBackend(ctx context.Context, config Config, listener gatewayconfig.Listener, forceVPNGate bool) (listenerBackendPlan, error) {
+	if !forceVPNGate && !listenerHasBackendPolicy(listener) && config.OpenVPNConfig != "" {
+		if _, err := os.Stat(config.OpenVPNConfig); err != nil {
+			return listenerBackendPlan{}, fmt.Errorf("OpenVPN 配置不可读: %w", err)
+		}
+		return listenerBackendPlan{
+			ConfigPath:   config.OpenVPNConfig,
+			StaticConfig: true,
+		}, nil
+	}
+
+	plan, err := s.selectAndProbeListenerNode(ctx, config, listener)
+	if err == nil {
+		return plan, nil
+	}
+	if forceVPNGate || listenerHasBackendPolicy(listener) || config.OpenVPNConfig == "" {
+		return listenerBackendPlan{}, err
+	}
+	if _, statErr := os.Stat(config.OpenVPNConfig); statErr != nil {
+		return listenerBackendPlan{}, fmt.Errorf("%v；OpenVPN 配置也不可读: %w", err, statErr)
+	}
+	return listenerBackendPlan{
+		ConfigPath:   config.OpenVPNConfig,
+		StaticConfig: true,
+	}, nil
+}
+
+func (s *Server) selectAndProbeListenerNode(ctx context.Context, config Config, listener gatewayconfig.Listener) (listenerBackendPlan, error) {
+	candidateIDs, err := s.listenerNodeCandidates(config, listener, maxBatchNodeTests)
+	if err != nil {
+		return listenerBackendPlan{}, err
+	}
+	if len(candidateIDs) == 0 {
+		s.refreshNodesInBackground()
+		candidateIDs, err = s.listenerNodeCandidates(config, listener, maxBatchNodeTests)
+		if err != nil {
+			return listenerBackendPlan{}, err
+		}
+	}
+	if len(candidateIDs) == 0 {
+		return listenerBackendPlan{}, errors.New("没有匹配 SOCKS5 绑定策略的可用 VPNGate 节点")
+	}
+
+	var lastError string
+	for _, nodeID := range candidateIDs {
+		node, err := s.probeNode(ctx, nodeID)
+		if err != nil {
+			lastError = err.Error()
+			continue
+		}
+		if node.ProbeStatus != "available" {
+			lastError = node.ProbeMessage
+			continue
+		}
+		path, err := s.writeNodeConfig(node)
+		if err != nil {
+			lastError = err.Error()
+			s.markNodeProbeFailed(nodeID, err.Error())
+			continue
+		}
+		return listenerBackendPlan{
+			ConfigPath:  path,
+			NodeID:      node.ID,
+			CountryCode: strings.ToUpper(strings.TrimSpace(node.CountryShort)),
+			EntryIP:     listenerNodeEntryIP(node),
+			EntryCIDRs:  append([]string(nil), listener.EntryCIDRs...),
+		}, nil
+	}
+	if lastError == "" {
+		lastError = "候选节点测试未通过"
+	}
+	return listenerBackendPlan{}, fmt.Errorf("没有通过可用性测试的 VPNGate 节点: %s", lastError)
+}
+
+func (s *Server) serveListenerBackend(ctx context.Context, session *Session, listener gatewayconfig.Listener, plan listenerBackendPlan) error {
+	logger := s.logger.With("listener", listener.Name, "listen", listener.ListenAddress())
+	if plan.NodeID != "" {
+		logger = logger.With("node", plan.NodeID)
+	}
+	backendCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	tunnel, err := vpn.Start(backendCtx, vpn.StartOptions{
+		ConfigPath:       plan.ConfigPath,
+		AuthFilePath:     session.config.OpenVPNAuth,
+		HandshakeTimeout: gatewayconfig.DefaultHandshakeTimeout,
+		Logger:           logger,
+	})
+	if err != nil {
+		return fmt.Errorf("启动用户态 OpenVPN 失败: %w", err)
+	}
+
+	dialer, err := vpn.NewDialer(backendCtx, tunnel, logger)
+	if err != nil {
+		_ = tunnel.Close()
+		return fmt.Errorf("初始化用户态 TCP/IP 栈失败: %w", err)
+	}
+	defer dialer.Close()
+
+	server := socks.NewServer(
+		listener.ListenAddress(),
+		dialer,
+		gatewayconfig.DefaultConnectTimeout,
+		logger,
+		socks.AuthConfig{Username: listener.Username, Password: listener.Password},
+	)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.Serve(backendCtx)
+	}()
+	proxyAddress, err := waitSocksAddress(backendCtx, server, errCh)
+	if err != nil {
+		_ = server.Close()
+		return err
+	}
+	defer func() {
+		cancel()
+		_ = server.Close()
+	}()
+
+	proxyURL := proxyURLForListener(listener, proxyAddress)
+	if result := checkProxy(proxyURL); !result.OK {
+		return fmt.Errorf("OpenVPN 后端首次健康检查失败: %s", result.Error)
+	}
+	s.updateListenerBackendState(session, listener, ListenerBackendState{
+		Status:      "running",
+		Message:     "SOCKS5 入口已绑定独立 OpenVPN 后端",
+		NodeID:      plan.NodeID,
+		CountryCode: plan.CountryCode,
+		EntryCIDRs:  plan.EntryCIDRs,
+		EntryIP:     plan.EntryIP,
+		ProxyURL:    proxyURL,
+	})
+	s.updateSession(session, "running", "每个 SOCKS5 入口均已绑定独立 OpenVPN 后端")
+
+	ticker := time.NewTicker(healthCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case err := <-errCh:
+			if err != nil && backendCtx.Err() == nil {
+				return fmt.Errorf("SOCKS5 网关异常退出: %w", err)
+			}
+			return nil
+		case <-ticker.C:
+			result := checkProxy(proxyURL)
+			if !result.OK {
+				return fmt.Errorf("OpenVPN 后端健康检查失败: %s", result.Error)
+			}
+			s.updateListenerBackendState(session, listener, ListenerBackendState{
+				Status:      "running",
+				Message:     "SOCKS5 入口已绑定独立 OpenVPN 后端",
+				NodeID:      plan.NodeID,
+				CountryCode: plan.CountryCode,
+				EntryCIDRs:  plan.EntryCIDRs,
+				EntryIP:     plan.EntryIP,
+				ExitIP:      result.IP,
+				ProxyURL:    proxyURL,
+			})
 		}
 	}
 }
@@ -983,6 +1450,74 @@ func (s *Server) updateSessionSocksURLs(session *Session, socksURLs []string) {
 	}
 }
 
+func (s *Server) updateListenerBackendState(session *Session, listener gatewayconfig.Listener, update ListenerBackendState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.session != session {
+		return
+	}
+	key := listenerBackendKey(listener)
+	if session.listenerBackends == nil {
+		session.listenerBackends = map[string]ListenerBackendState{}
+	}
+	previous := session.listenerBackends[key]
+	state := previous
+	state.ListenerName = listener.Name
+	state.ListenAddress = listener.ListenAddress()
+	if state.ProxyURL == "" {
+		state.ProxyURL = listenerProxyURL(listener, listener.ListenAddress())
+	}
+	if update.ProxyURL != "" {
+		state.ProxyURL = update.ProxyURL
+	}
+	if update.Status != "" {
+		state.Status = update.Status
+	}
+	if update.Message != "" {
+		state.Message = update.Message
+	}
+	state.NodeID = update.NodeID
+	state.CountryCode = update.CountryCode
+	state.EntryCIDRs = append([]string(nil), update.EntryCIDRs...)
+	state.EntryIP = update.EntryIP
+	state.ExitIP = update.ExitIP
+	state.Error = update.Error
+	session.listenerBackends[key] = state
+	s.recomputeActiveNodesLocked(session)
+}
+
+func (s *Server) recomputeActiveNodesLocked(session *Session) {
+	active := map[string]struct{}{}
+	if session != nil {
+		for _, backend := range session.listenerBackends {
+			if backend.Status == "running" && backend.NodeID != "" {
+				active[backend.NodeID] = struct{}{}
+			}
+		}
+	}
+	for idx := range s.nodes {
+		_, ok := active[s.nodes[idx].ID]
+		s.nodes[idx].Active = ok
+	}
+}
+
+func (s *Server) activeNodeIDsLocked() map[string]struct{} {
+	active := map[string]struct{}{}
+	if s.session != nil {
+		for _, backend := range s.session.listenerBackends {
+			if backend.Status == "running" && backend.NodeID != "" {
+				active[backend.NodeID] = struct{}{}
+			}
+		}
+	}
+	for _, node := range s.nodes {
+		if node.Active {
+			active[node.ID] = struct{}{}
+		}
+	}
+	return active
+}
+
 func (s *Server) finishSession(session *Session, status string, message string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -991,15 +1526,11 @@ func (s *Server) finishSession(session *Session, status string, message string) 
 		session.message = message
 		s.session = nil
 	}
+	s.recomputeActiveNodesLocked(nil)
 	s.logger.Info("用户态会话结束", "status", status, "message", message)
 	if status == "error" {
 		if session.nodeID != "" {
 			s.failed[session.nodeID] = message
-			for idx := range s.nodes {
-				if s.nodes[idx].ID == session.nodeID {
-					s.nodes[idx].Active = false
-				}
-			}
 		}
 		go s.tryAutoConnect()
 	}
@@ -1039,15 +1570,10 @@ func (s *Server) refreshNodesInBackground() {
 		return
 	}
 	s.mu.Lock()
-	activeID := ""
-	for _, node := range s.nodes {
-		if node.Active {
-			activeID = node.ID
-			break
-		}
-	}
+	activeIDs := s.activeNodeIDsLocked()
 	for idx := range nodes {
-		nodes[idx].Active = nodes[idx].ID == activeID
+		_, active := activeIDs[nodes[idx].ID]
+		nodes[idx].Active = active
 	}
 	s.nodes = nodes
 	s.mu.Unlock()
@@ -1056,24 +1582,50 @@ func (s *Server) refreshNodesInBackground() {
 
 func (s *Server) tryAutoConnect() {
 	s.mu.Lock()
-	if !s.config.AutoConnect || s.session != nil || len(s.nodes) == 0 {
+	if !s.config.AutoConnect || s.session != nil {
 		s.mu.Unlock()
 		return
 	}
 	config := s.config
-	failed := make(map[string]string, len(s.failed))
-	for key, value := range s.failed {
-		failed[key] = value
-	}
-	nodeID := selectNodeID(config, s.nodes, failed)
+	nodesCount := len(s.nodes)
 	s.mu.Unlock()
-	if nodeID == "" {
-		s.logger.Warn("自动连接未找到符合路由策略的节点", "routing_mode", config.RoutingMode, "country", config.ForceCountry, "fixed_node", config.FixedNodeID)
+
+	if config.OpenVPNConfig == "" {
+		if nodesCount == 0 || !hasListenerBackendPolicy(config.SocksListeners) {
+			s.logger.Warn("自动连接已跳过，未配置 OpenVPN 配置文件或 SOCKS5 入口绑定策略")
+			return
+		}
+	} else if _, err := os.Stat(config.OpenVPNConfig); err != nil {
+		s.logger.Warn("自动连接已跳过，OpenVPN 配置不可读", "path", config.OpenVPNConfig, "error", err)
 		return
 	}
-	if err := s.startNodeSession(nodeID); err != nil {
-		s.logger.Warn("自动连接节点失败", "node", nodeID, "error", err)
+
+	if err := s.startConfiguredSession(config); err != nil {
+		s.logger.Warn("自动连接 OpenVPN 配置失败", "path", config.OpenVPNConfig, "error", err)
 	}
+}
+
+func (s *Server) startConfiguredSession(config Config) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.session != nil {
+		return errors.New("当前已有活动连接")
+	}
+	for idx := range s.nodes {
+		s.nodes[idx].Active = false
+	}
+	sessionCtx, cancel := context.WithCancel(context.Background())
+	session := &Session{
+		startedAt:        time.Now(),
+		config:           config,
+		cancel:           cancel,
+		status:           "starting",
+		message:          "正在自动连接 OpenVPN 配置",
+		listenerBackends: map[string]ListenerBackendState{},
+	}
+	s.session = session
+	go s.runSession(sessionCtx, session)
+	return nil
 }
 
 func selectNodeID(config Config, nodes []vpngate.Node, failed map[string]string) string {
@@ -1102,6 +1654,62 @@ func selectNodeID(config Config, nodes []vpngate.Node, failed map[string]string)
 	}
 }
 
+func (s *Server) listenerNodeCandidates(config Config, listener gatewayconfig.Listener, limit int) ([]string, error) {
+	s.mu.Lock()
+	nodes := make([]vpngate.Node, len(s.nodes))
+	copy(nodes, s.nodes)
+	failed := make(map[string]string, len(s.failed))
+	for key, value := range s.failed {
+		failed[key] = value
+	}
+	s.mu.Unlock()
+	return selectListenerNodeIDs(config, listener, nodes, failed, limit)
+}
+
+func selectListenerNodeIDs(config Config, listener gatewayconfig.Listener, nodes []vpngate.Node, failed map[string]string, limit int) ([]string, error) {
+	if limit <= 0 {
+		limit = len(nodes)
+	}
+	fixedNodeID := strings.TrimSpace(listener.FixedNodeID)
+	if fixedNodeID == "" && config.RoutingMode == "fixed_ip" {
+		fixedNodeID = strings.TrimSpace(config.FixedNodeID)
+	}
+	if fixedNodeID != "" {
+		for _, node := range nodes {
+			if node.ID == fixedNodeID && !nodeFailed(node.ID, failed) {
+				return []string{node.ID}, nil
+			}
+		}
+		return []string{}, nil
+	}
+	countryCode := strings.ToUpper(strings.TrimSpace(listener.CountryCode))
+	if countryCode == "" && config.RoutingMode == "fixed_region" {
+		countryCode = strings.ToUpper(strings.TrimSpace(config.ForceCountry))
+	}
+	cidrs, err := parseCIDRs(listener.EntryCIDRs)
+	if err != nil {
+		return nil, err
+	}
+
+	var ids []string
+	for _, node := range nodes {
+		if node.ID == "" || nodeFailed(node.ID, failed) {
+			continue
+		}
+		if countryCode != "" && !strings.EqualFold(node.CountryShort, countryCode) {
+			continue
+		}
+		if len(cidrs) > 0 && !nodeEntryMatchesCIDRs(node, cidrs) {
+			continue
+		}
+		ids = append(ids, node.ID)
+		if len(ids) >= limit {
+			break
+		}
+	}
+	return ids, nil
+}
+
 func nodeFailed(nodeID string, failed map[string]string) bool {
 	if len(failed) == 0 {
 		return false
@@ -1110,22 +1718,136 @@ func nodeFailed(nodeID string, failed map[string]string) bool {
 	return ok
 }
 
+func parseCIDRs(values []string) ([]*net.IPNet, error) {
+	if len(values) == 0 {
+		return nil, nil
+	}
+	cidrs := make([]*net.IPNet, 0, len(values))
+	for _, value := range values {
+		cidr := strings.TrimSpace(value)
+		if cidr == "" {
+			continue
+		}
+		_, network, err := net.ParseCIDR(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("入口网段 CIDR 无效: %s", cidr)
+		}
+		cidrs = append(cidrs, network)
+	}
+	return cidrs, nil
+}
+
+func nodeEntryMatchesCIDRs(node vpngate.Node, cidrs []*net.IPNet) bool {
+	ip := net.ParseIP(listenerNodeEntryIP(node))
+	if ip == nil {
+		return false
+	}
+	for _, cidr := range cidrs {
+		if cidr.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+func listenerNodeEntryIP(node vpngate.Node) string {
+	for _, value := range []string{node.RemoteHost, node.IP} {
+		value = strings.TrimSpace(value)
+		if ip := net.ParseIP(value); ip != nil {
+			return ip.String()
+		}
+	}
+	return ""
+}
+
+func listenerHasBackendPolicy(listener gatewayconfig.Listener) bool {
+	if strings.TrimSpace(listener.CountryCode) != "" || strings.TrimSpace(listener.FixedNodeID) != "" {
+		return true
+	}
+	for _, cidr := range listener.EntryCIDRs {
+		if strings.TrimSpace(cidr) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func failoverBackoff(retry int) time.Duration {
+	if retry < 0 {
+		retry = 0
+	}
+	if retry > 5 {
+		retry = 5
+	}
+	return time.Duration(1<<retry) * time.Second
+}
+
+func sleepWithContext(ctx context.Context, duration time.Duration) bool {
+	if duration <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func isSocksListenFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := err.Error()
+	return strings.Contains(text, "监听 SOCKS5 地址失败") ||
+		strings.Contains(text, "address already in use") ||
+		strings.Contains(text, "permission denied")
+}
+
+func listenerBackendKey(listener gatewayconfig.Listener) string {
+	return listener.ListenAddress()
+}
+
 func localProxyURLs(listeners []gatewayconfig.Listener) []string {
 	var values []string
 	for _, listener := range listeners {
 		if !listener.IsEnabled() {
 			continue
 		}
-		proxyURL := url.URL{
-			Scheme: "socks5h",
-			Host:   net.JoinHostPort(listener.Host, fmt.Sprintf("%d", listener.Port)),
-		}
-		if listener.HasAuth() {
-			proxyURL.User = url.UserPassword(listener.Username, listener.Password)
-		}
-		values = append(values, proxyURL.String())
+		values = append(values, listenerProxyURL(listener, listener.ListenAddress()))
 	}
 	return values
+}
+
+func proxyURLForListener(listener gatewayconfig.Listener, proxyAddress string) string {
+	if proxyAddress == "" {
+		proxyAddress = listener.ListenAddress()
+	}
+	if host, port, err := net.SplitHostPort(proxyAddress); err == nil {
+		ip := net.ParseIP(host)
+		if ip != nil && ip.IsUnspecified() {
+			if ip.To4() != nil {
+				host = "127.0.0.1"
+			} else {
+				host = "::1"
+			}
+			proxyAddress = net.JoinHostPort(host, port)
+		}
+	}
+	return listenerProxyURL(listener, proxyAddress)
+}
+
+func listenerProxyURL(listener gatewayconfig.Listener, hostPort string) string {
+	proxyURL := url.URL{
+		Scheme: "socks5h",
+		Host:   hostPort,
+	}
+	if listener.HasAuth() {
+		proxyURL.User = url.UserPassword(listener.Username, listener.Password)
+	}
+	return proxyURL.String()
 }
 
 func checkProxy(proxyURL string) ProxyTestResult {

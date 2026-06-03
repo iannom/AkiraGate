@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 600" role="img" aria-label="Taiwan flag">
+  <rect width="900" height="600" fill="#fe0000"/>
+  <rect width="450" height="300" fill="#000095"/>
+  <g transform="translate(225 150)">
+    <polygon points="0,-112 16,-48 -16,-48" fill="#fff"/>
+    <polygon points="0,-112 16,-48 -16,-48" fill="#fff" transform="rotate(30)"/>
+    <polygon points="0,-112 16,-48 -16,-48" fill="#fff" transform="rotate(60)"/>
+    <polygon points="0,-112 16,-48 -16,-48" fill="#fff" transform="rotate(90)"/>
+    <polygon points="0,-112 16,-48 -16,-48" fill="#fff" transform="rotate(120)"/>
+    <polygon points="0,-112 16,-48 -16,-48" fill="#fff" transform="rotate(150)"/>
+    <polygon points="0,-112 16,-48 -16,-48" fill="#fff" transform="rotate(180)"/>
+    <polygon points="0,-112 16,-48 -16,-48" fill="#fff" transform="rotate(210)"/>
+    <polygon points="0,-112 16,-48 -16,-48" fill="#fff" transform="rotate(240)"/>
+    <polygon points="0,-112 16,-48 -16,-48" fill="#fff" transform="rotate(270)"/>
+    <polygon points="0,-112 16,-48 -16,-48" fill="#fff" transform="rotate(300)"/>
+    <polygon points="0,-112 16,-48 -16,-48" fill="#fff" transform="rotate(330)"/>
+    <circle r="62" fill="#fff"/>
+    <circle r="36" fill="#000095"/>
+  </g>
+</svg>

@@ -403,6 +403,11 @@ h2 {
   border-bottom: 1px solid var(--line);
 }
 
+.node-row.testing {
+  background: rgba(64, 141, 255, 0.1);
+  box-shadow: inset 3px 0 0 var(--primary);
+}
+
 .node-head {
   position: sticky;
   top: 0;
@@ -466,6 +471,16 @@ h2 {
 .country-flag {
   object-fit: cover;
   display: inline-block;
+}
+
+.country-flag-emoji {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
+  font-size: 15px;
+  line-height: 1;
 }
 
 .flag-fallback {

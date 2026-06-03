@@ -24,12 +24,15 @@ type Config struct {
 }
 
 type Listener struct {
-	Name     string `json:"name"`
-	Host     string `json:"host"`
-	Port     int    `json:"port"`
-	Username string `json:"username,omitempty"`
-	Password string `json:"password,omitempty"`
-	Enabled  *bool  `json:"enabled,omitempty"`
+	Name        string   `json:"name"`
+	Host        string   `json:"host"`
+	Port        int      `json:"port"`
+	Username    string   `json:"username,omitempty"`
+	Password    string   `json:"password,omitempty"`
+	Enabled     *bool    `json:"enabled,omitempty"`
+	CountryCode string   `json:"country_code,omitempty"`
+	EntryCIDRs  []string `json:"entry_cidrs,omitempty"`
+	FixedNodeID string   `json:"fixed_node_id,omitempty"`
 }
 
 func DefaultListener() Listener {
@@ -106,6 +109,9 @@ func ValidateListeners(listeners []Listener) error {
 		if listener.HasAuth() && (listener.Username == "" || listener.Password == "") {
 			return fmt.Errorf("SOCKS5 监听 %s 的用户名和密码必须同时填写", listener.ListenAddress())
 		}
+		if err := validateListenerBackendPolicy(listener); err != nil {
+			return err
+		}
 		key := listener.ListenAddress()
 		if _, ok := enabledListeners[key]; ok {
 			return fmt.Errorf("SOCKS5 监听地址重复: %s", key)
@@ -116,6 +122,39 @@ func ValidateListeners(listeners []Listener) error {
 		return errors.New("至少需要启用一个 SOCKS5 监听端口")
 	}
 	return nil
+}
+
+func validateListenerBackendPolicy(listener Listener) error {
+	if listener.CountryCode != "" && !validCountryCode(listener.CountryCode) {
+		return fmt.Errorf("SOCKS5 监听 %s 的绑定国家代码无效: %s", listener.ListenAddress(), listener.CountryCode)
+	}
+	for _, value := range listener.EntryCIDRs {
+		cidr := strings.TrimSpace(value)
+		if cidr == "" {
+			continue
+		}
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("SOCKS5 监听 %s 的入口网段 CIDR 无效: %s", listener.ListenAddress(), cidr)
+		}
+	}
+	return nil
+}
+
+func validCountryCode(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) != 2 {
+		return false
+	}
+	for _, ch := range value {
+		if ch >= 'a' && ch <= 'z' {
+			continue
+		}
+		if ch >= 'A' && ch <= 'Z' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func isUnspecifiedHost(host string) bool {

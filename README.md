@@ -31,7 +31,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/iannom/AkiraGate/main/install.
 - Web 管理端使用单用户登录系统，密码落盘为 bcrypt 哈希，后端接口统一校验会话 Cookie。
 - Web 管理页面可刷新 VPNGate 官方节点列表、测试节点连通性，并选择节点建立用户态 OpenVPN 连接。
 - Web 管理页面可检测 SOCKS5 出口 IP、查看网关组件状态和运行日志。
-- 后台可定时刷新 VPNGate 节点，并按自动、固定国家地区或固定节点策略连接。
+- 后台可定时刷新 VPNGate 节点；启动自动连接仅用于已配置的本地 OpenVPN 配置文件。
 
 ## 配置文件
 
@@ -52,7 +52,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/iannom/AkiraGate/main/install.
   "admin_password_hash": "$2a$10$example-bcrypt-hash",
   "openvpn_config": "/opt/akiragate/client.ovpn",
   "openvpn_auth": "/opt/akiragate/akiragate_data/vpngate_auth.txt",
-  "auto_connect": true,
+  "auto_connect": false,
   "refresh_seconds": 960,
   "routing_mode": "auto",
   "force_country": "",
@@ -78,7 +78,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/iannom/AkiraGate/main/install.
 }
 ```
 
-`admin_password_hash` 由服务首次读取明文初始密码或在 Web 页面修改密码时自动生成。`openvpn_config` 可用于手动连接本地 OpenVPN 配置文件；也可以在 Web 页面点击“刷新 VPNGate 节点”，直接选择公开节点连接。
+`admin_password_hash` 由服务首次读取明文初始密码或在 Web 页面修改密码时自动生成。`openvpn_config` 可用于手动连接本地 OpenVPN 配置文件；`auto_connect` 只会在已设置可读 `openvpn_config` 时于服务启动后自动连接。也可以在 Web 页面点击“刷新 VPNGate 节点”，手动选择公开节点连接。
 
 ## 使用 SOCKS5
 
