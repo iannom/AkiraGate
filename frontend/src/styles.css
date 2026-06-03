@@ -261,6 +261,67 @@ h2 {
   margin-bottom: 12px;
 }
 
+.overview-section {
+  margin-bottom: 12px;
+}
+
+.overview-title-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 5px;
+}
+
+.overview-title-line label {
+  margin: 0;
+}
+
+.backend-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 10px;
+}
+
+.backend-card {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #0c0e12;
+  padding: 10px;
+}
+
+.backend-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.backend-head strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail-lines {
+  display: grid;
+  gap: 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.detail-lines span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.error-text {
+  color: #fecdd3;
+}
+
 .stacked-fields {
   display: grid;
   gap: 12px;

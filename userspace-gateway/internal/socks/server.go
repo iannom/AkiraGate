@@ -106,18 +106,21 @@ func (s *Server) Address() string {
 
 func (s *Server) handleClient(ctx context.Context, client net.Conn) {
 	defer client.Close()
+	clientIP := remoteIP(client.RemoteAddr())
 	if err := client.SetDeadline(time.Now().Add(30 * time.Second)); err != nil {
 		s.logger.Warn("设置客户端超时失败", "error", err)
 	}
 
 	target, err := s.handshake(client)
 	if err != nil {
+		s.logger.Warn("SOCKS5 入口连接审计", "client_ip", clientIP, "result", "handshake_failed", "error", err)
 		s.logger.Warn("SOCKS5 握手失败", "client", client.RemoteAddr().String(), "error", err)
 		return
 	}
 
 	upstream, err := s.dialer.DialContext(ctx, target.Host, target.Port, s.connectTimeout)
 	if err != nil {
+		s.logger.Warn("SOCKS5 入口连接审计", "client_ip", clientIP, "target", target.String(), "result", "dial_failed", "error", err)
 		s.logger.Warn("SOCKS5 目标连接失败", "target", target.String(), "error", err)
 		_ = sendReply(client, 0x04)
 		return
@@ -125,11 +128,24 @@ func (s *Server) handleClient(ctx context.Context, client net.Conn) {
 	defer upstream.Close()
 
 	if err := sendReply(client, 0x00); err != nil {
+		s.logger.Warn("SOCKS5 入口连接审计", "client_ip", clientIP, "target", target.String(), "result", "reply_failed", "error", err)
 		s.logger.Warn("SOCKS5 响应失败", "target", target.String(), "error", err)
 		return
 	}
+	s.logger.Info("SOCKS5 入口连接审计", "client_ip", clientIP, "target", target.String(), "result", "connected")
 	_ = client.SetDeadline(time.Time{})
 	relay(client, upstream)
+}
+
+func remoteIP(address net.Addr) string {
+	if address == nil {
+		return ""
+	}
+	host, _, err := net.SplitHostPort(address.String())
+	if err != nil {
+		return address.String()
+	}
+	return host
 }
 
 type Target struct {

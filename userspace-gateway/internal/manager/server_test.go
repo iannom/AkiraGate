@@ -511,6 +511,78 @@ func TestConnectNodeToListenerPersistsConfigAndClearsFailedNode(t *testing.T) {
 	}
 }
 
+func TestConnectSwitchesExistingSession(t *testing.T) {
+	server := testServer(t)
+	server.config.SocksListeners = []gatewayconfig.Listener{}
+	server.nodes = []vpngate.Node{{
+		ID:         "jp-1",
+		ConfigText: "client\nremote 203.0.113.10 1194\n",
+	}}
+	cancelled := false
+	server.session = &Session{
+		startedAt:        time.Now(),
+		cancel:           func() { cancelled = true },
+		status:           "running",
+		message:          "旧连接",
+		listenerBackends: map[string]ListenerBackendState{},
+	}
+	req := httptest.NewRequest(http.MethodPost, "/secret/api/connect", bytes.NewReader([]byte(`{"node_id":"jp-1"}`)))
+	addLoginCookie(t, server, req)
+	rec := httptest.NewRecorder()
+
+	server.route(rec, req)
+	defer server.disconnect(httptest.NewRecorder())
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("已有连接时连接新节点应切换而不是拒绝，实际: %d %s", rec.Code, rec.Body.String())
+	}
+	var payload struct {
+		Switched bool `json:"switched"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("切换连接响应不是有效 JSON: %v", err)
+	}
+	if !payload.Switched {
+		t.Fatal("切换连接响应应标记 switched=true")
+	}
+	if !cancelled {
+		t.Fatal("切换连接应取消旧会话")
+	}
+}
+
+func TestFinishOldSessionDoesNotClearNewSessionActiveNodes(t *testing.T) {
+	server := testServer(t)
+	listener := gatewayconfig.NewListener("local", "127.0.0.1", 7928, true)
+	oldSession := &Session{
+		startedAt:        time.Now(),
+		cancel:           func() {},
+		listenerBackends: map[string]ListenerBackendState{},
+	}
+	newSession := &Session{
+		startedAt: time.Now(),
+		cancel:    func() {},
+		listenerBackends: map[string]ListenerBackendState{
+			listenerBackendKey(listener): {
+				ListenerName:  listener.Name,
+				ListenAddress: listener.ListenAddress(),
+				Status:        "running",
+				NodeID:        "node-new",
+			},
+		},
+	}
+	server.session = newSession
+	server.nodes = []vpngate.Node{{ID: "node-new", Active: true}}
+
+	server.finishSession(oldSession, "stopped", "旧连接已退出")
+
+	if server.session != newSession {
+		t.Fatal("旧会话退出不应清空当前新会话")
+	}
+	if !server.nodes[0].Active {
+		t.Fatal("旧会话退出不应清空新会话活动节点状态")
+	}
+}
+
 func TestFetchIPPureInfoParsesExitProfile(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -634,6 +706,15 @@ func TestProbeNodesConcurrentlyReturnsMoreThanEightNodes(t *testing.T) {
 	}
 }
 
+func TestBatchProbeWorkerCountMatchesSelectedNodesUpToCap(t *testing.T) {
+	if workerCount := batchProbeWorkerCount(12); workerCount != 12 {
+		t.Fatalf("批量真测 worker 应等于选中节点数，实际: %d", workerCount)
+	}
+	if workerCount := batchProbeWorkerCount(maxBatchTestWorkers + 10); workerCount != maxBatchTestWorkers {
+		t.Fatalf("超出上限时 worker 应受保护性上限限制，实际: %d", workerCount)
+	}
+}
+
 func TestBatchNodeTestLifecycleRejectsConcurrentBatch(t *testing.T) {
 	server := testServer(t)
 
@@ -686,6 +767,123 @@ func TestCancelTestNodesAPI(t *testing.T) {
 	}
 	if !payload.Cancelled {
 		t.Fatal("取消已有批量测试时应返回 cancelled=true")
+	}
+}
+
+func TestCancelTestNodeAPIOnlyCancelsSelectedTestingNode(t *testing.T) {
+	server := testServer(t)
+	server.nodes = []vpngate.Node{{
+		ID:           "node-a",
+		ProbeStatus:  probeStatusTesting,
+		ProbeMessage: "正在测试节点真实出口",
+	}}
+	_, batch, ok := server.startBatchNodeTest()
+	if !ok {
+		t.Fatal("测试前置批量任务启动失败")
+	}
+	defer server.finishBatchNodeTest(batch)
+	server.setBatchNodeTestIDs(batch, []string{"node-a"})
+
+	req := httptest.NewRequest(http.MethodPost, "/secret/api/cancel_test_node", bytes.NewReader([]byte(`{"node_id":"node-a"}`)))
+	addLoginCookie(t, server, req)
+	rec := httptest.NewRecorder()
+
+	server.route(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("取消单节点测试应返回 200，实际: %d", rec.Code)
+	}
+	var payload struct {
+		Cancelled bool         `json:"cancelled"`
+		Node      vpngate.Node `json:"node"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("取消单节点响应不是有效 JSON: %v", err)
+	}
+	if !payload.Cancelled || payload.Node.ProbeStatus != "cancelled" {
+		t.Fatalf("单节点取消响应不符合预期: %+v", payload)
+	}
+}
+
+func TestCancelTestNodeAPIDoesNotCancelAlreadyAvailableNode(t *testing.T) {
+	server := testServer(t)
+	cancelled := false
+	token := &nodeTestToken{}
+	server.nodes = []vpngate.Node{{
+		ID:          "node-a",
+		ProbeStatus: "available",
+	}}
+	server.nodeTests["node-a"] = nodeTestCancel{
+		cancel: func() { cancelled = true },
+		token:  token,
+	}
+	_, batch, ok := server.startBatchNodeTest()
+	if !ok {
+		t.Fatal("测试前置批量任务启动失败")
+	}
+	defer server.finishBatchNodeTest(batch)
+	server.setBatchNodeTestIDs(batch, []string{"node-a"})
+
+	req := httptest.NewRequest(http.MethodPost, "/secret/api/cancel_test_node", bytes.NewReader([]byte(`{"node_id":"node-a"}`)))
+	addLoginCookie(t, server, req)
+	rec := httptest.NewRecorder()
+
+	server.route(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("取消已完成节点应返回 200，实际: %d", rec.Code)
+	}
+	var payload struct {
+		Cancelled bool `json:"cancelled"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("取消单节点响应不是有效 JSON: %v", err)
+	}
+	if payload.Cancelled {
+		t.Fatal("已通过测试的节点不应被单独取消")
+	}
+	if cancelled {
+		t.Fatal("已完成节点即使存在尚未注销的测试 token，也不应触发取消")
+	}
+	if server.nodes[0].ProbeStatus != "available" {
+		t.Fatalf("已通过节点状态不应被改写，实际: %+v", server.nodes[0])
+	}
+}
+
+func TestProbeNodesConcurrentlyCancelsSingleQueuedNode(t *testing.T) {
+	server := testServer(t)
+	server.nodes = []vpngate.Node{{
+		ID:           "node-a",
+		ProbeStatus:  probeStatusTesting,
+		ProbeMessage: "正在测试节点真实出口",
+	}, {
+		ID:           "node-b",
+		ProbeStatus:  probeStatusTesting,
+		ProbeMessage: "正在测试节点真实出口",
+	}}
+	_, batch, ok := server.startBatchNodeTest()
+	if !ok {
+		t.Fatal("测试前置批量任务启动失败")
+	}
+	defer server.finishBatchNodeTest(batch)
+	server.setBatchNodeTestIDs(batch, []string{"node-a", "node-b"})
+	if _, cancelled := server.cancelNodeTest("node-b"); !cancelled {
+		t.Fatal("应能取消批量任务中的单个节点")
+	}
+	probe := func(_ context.Context, nodeID string) (vpngate.Node, error) {
+		return vpngate.Node{ID: nodeID, ProbeStatus: "available"}, nil
+	}
+
+	nodes, cancelled := server.probeNodesConcurrentlyWith(context.Background(), []string{"node-a", "node-b"}, 1, probe)
+
+	if !cancelled {
+		t.Fatal("单节点取消后批量结果应标记 cancelled=true")
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("批量测试应返回所有节点状态，实际: %d", len(nodes))
+	}
+	if nodes[0].ProbeStatus != "available" || nodes[1].ProbeStatus != "cancelled" {
+		t.Fatalf("单节点取消结果不符合预期: %+v", nodes)
 	}
 }
 

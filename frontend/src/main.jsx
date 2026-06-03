@@ -173,19 +173,24 @@ function mergeNodeResults(state, nodeResults) {
 }
 
 async function api(path, options = {}) {
+  const { allowErrorData = false, ...fetchOptions } = options;
   const response = await fetch(`./api/${path}`, {
-    ...options,
+    ...fetchOptions,
     credentials: "same-origin",
     headers: {
-      ...(options.body ? { "Content-Type": "application/json" } : {}),
-      ...(options.headers || {}),
+      ...(fetchOptions.body ? { "Content-Type": "application/json" } : {}),
+      ...(fetchOptions.headers || {}),
     },
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok || data.ok === false) {
-    const error = response.status === 401
-      ? new AuthError(data.error || "未登录或登录已过期")
-      : new Error(data.error || response.statusText || "请求失败");
+    if (allowErrorData && response.status !== 401) {
+      return { ...data, http_status: response.status };
+    }
+    const error =
+      response.status === 401
+        ? new AuthError(data.error || "未登录或登录已过期")
+        : new Error(data.error || response.statusText || "请求失败");
     error.status = response.status;
     throw error;
   }
@@ -290,6 +295,7 @@ function App() {
   const [listeners, setListeners] = useState([]);
   const [logs, setLogs] = useState([]);
   const [gatewayComponents, setGatewayComponents] = useState([]);
+  const [proxyTestResult, setProxyTestResult] = useState(null);
   const [formDirty, setFormDirty] = useState(false);
   const [actionMsg, setActionMsg] = useState("");
   const [saveMsg, setSaveMsg] = useState("");
@@ -308,6 +314,7 @@ function App() {
     if (error instanceof AuthError) {
       setAuth({ checked: true, authenticated: false, username: "" });
       setCurrent(null);
+      setProxyTestResult(null);
       setLoginMessage(error.message);
       return true;
     }
@@ -476,6 +483,7 @@ function App() {
       setCurrent(null);
       setLogs([]);
       setGatewayComponents([]);
+      setProxyTestResult(null);
       setBusyAction("");
     }
   };
@@ -580,7 +588,10 @@ function App() {
     runAction(
       "connect",
       "正在发送连接请求...",
-      () => api("connect", { method: "POST" }),
+      () => {
+        setProxyTestResult(null);
+        return api("connect", { method: "POST" });
+      },
       (result) => result.message || "已启动",
     );
 
@@ -588,7 +599,10 @@ function App() {
     runAction(
       `connect-${nodeID}`,
       "正在连接节点...",
-      () => api("connect", { method: "POST", body: JSON.stringify({ node_id: nodeID, listen_address: listenAddress }) }),
+      () => {
+        setProxyTestResult(null);
+        return api("connect", { method: "POST", body: JSON.stringify({ node_id: nodeID, listen_address: listenAddress }) });
+      },
       (result) => result.message || "已启动",
     );
 
@@ -602,6 +616,20 @@ function App() {
         return result;
       },
       (result) => `节点测试完成: ${result.node?.probe_status || "unknown"}`,
+    );
+
+  const cancelTestNode = (nodeID) =>
+    runAction(
+      `cancel-test-${nodeID}`,
+      "正在取消节点测试...",
+      async () => {
+        const result = await api("cancel_test_node", { method: "POST", body: JSON.stringify({ node_id: nodeID }) });
+        if (result.node) {
+          mergeNodeResultsIntoCurrent(result.node);
+        }
+        return result;
+      },
+      (result) => result.message || "已请求取消节点测试",
     );
 
   const testNodes = async (nodeIDs) => {
@@ -651,7 +679,10 @@ function App() {
     runAction(
       "disconnect",
       "正在断开...",
-      () => api("disconnect", { method: "POST" }),
+      () => {
+        setProxyTestResult(null);
+        return api("disconnect", { method: "POST" });
+      },
       () => "已断开",
     );
 
@@ -667,8 +698,12 @@ function App() {
     runAction(
       "test-proxy",
       "正在检测 SOCKS5 出口...",
-      () => api("test_proxy", { method: "POST" }),
-      (result) => `出口 IP ${result.ip || "-"}，延迟 ${result.latency_ms || 0} ms`,
+      async () => {
+        const result = await api("test_proxy", { method: "POST", allowErrorData: true });
+        setProxyTestResult(result);
+        return result;
+      },
+      (result) => formatProxyTestMessage(result),
     );
 
   if (!auth.checked) {
@@ -737,6 +772,7 @@ function App() {
           restartHint={restartHint}
           actionMsg={actionMsg}
           busyAction={busyAction}
+          proxyTestResult={proxyTestResult}
           onConnect={connect}
           onDisconnect={disconnect}
           onTestProxy={testProxy}
@@ -753,9 +789,11 @@ function App() {
           actionMsg={actionMsg}
           onRefreshNodes={refreshNodes}
           onTest={testNode}
+          onCancelTest={cancelTestNode}
           onTestBatch={testNodes}
           onCancelBatchTest={cancelTestNodes}
           onConnect={connectNode}
+          onDisconnect={disconnect}
         />
       ) : null}
 
@@ -793,7 +831,7 @@ function App() {
   );
 }
 
-function OverviewPage({ current, runtimeWeb, restartHint, actionMsg, busyAction, onConnect, onDisconnect, onTestProxy, onRefresh }) {
+function OverviewPage({ current, runtimeWeb, restartHint, actionMsg, busyAction, proxyTestResult, onConnect, onDisconnect, onTestProxy, onRefresh }) {
   return (
     <section className="panel">
       <SectionTitle icon={Activity} title="连接概览" />
@@ -807,6 +845,8 @@ function OverviewPage({ current, runtimeWeb, restartHint, actionMsg, busyAction,
         <Readout label="当前 Web 监听" value={runtimeWeb} mono />
         <Readout label="配置生效状态" value={restartHint} />
       </div>
+      <ListenerBackendOverview current={current} />
+      <ProxyTestDetails result={proxyTestResult} />
       <div className="actions">
         <ActionButton icon={Play} label="连接" primary busy={busyAction === "connect"} onClick={onConnect} />
         <ActionButton icon={Power} label="断开" danger busy={busyAction === "disconnect"} onClick={onDisconnect} />
@@ -818,6 +858,77 @@ function OverviewPage({ current, runtimeWeb, restartHint, actionMsg, busyAction,
   );
 }
 
+function ListenerBackendOverview({ current }) {
+  const backends = current?.listener_backends || [];
+  if (!backends.length) {
+    return (
+      <div className="overview-section">
+        <label>SOCKS5 入口连接</label>
+        <div className="readout">暂无运行中的入口后端状态。</div>
+      </div>
+    );
+  }
+  return (
+    <div className="overview-section">
+      <label>SOCKS5 入口连接</label>
+      <div className="backend-grid">
+        {backends.map((backend) => (
+          <div className="backend-card" key={backend.listen_address || backend.listener_name}>
+            <div className="backend-head">
+              <strong>{backend.listener_name || backend.listen_address || "-"}</strong>
+              <span className={`badge ${backend.status === "running" ? "ok" : backend.status === "error" ? "err" : ""}`}>{formatBackendStatus(backend.status)}</span>
+            </div>
+            <div className="detail-lines">
+              <span>监听 {backend.listen_address || "-"}</span>
+              {backend.node_id ? <span>节点 {backend.node_id}</span> : null}
+              {backend.entry_ip ? <span>入口 IP {backend.entry_ip}</span> : null}
+              {backend.exit_ip ? <span>出口 IP {backend.exit_ip}</span> : null}
+              {backend.country_code ? <span>国家 {backend.country_code}</span> : null}
+              {backend.entry_cidrs?.length ? <span>入口网段 {backend.entry_cidrs.join(", ")}</span> : null}
+              {backend.proxy_url ? <span className="mono">代理 {backend.proxy_url}</span> : null}
+              {backend.error ? <span className="error-text">{backend.error}</span> : <span>{backend.message || "-"}</span>}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ProxyTestDetails({ result }) {
+  if (!result) {
+    return null;
+  }
+  const results = proxyResultsFromResponse(result);
+  return (
+    <div className="overview-section">
+      <div className="overview-title-line">
+        <label>出口检测结果</label>
+        <span className={`badge ${result.ok ? "ok" : "err"}`}>{result.ok ? "通过" : "失败"}</span>
+      </div>
+      <div className="backend-grid">
+        {results.map((item, index) => (
+          <div className="backend-card" key={`${item.listen || item.proxy_url || item.ip || "proxy"}-${index}`}>
+            <div className="backend-head">
+              <strong>{formatProxyResultTitle(item, index)}</strong>
+              <span className={`badge ${item.ok ? "ok" : "err"}`}>{item.ok ? "通过" : "失败"}</span>
+            </div>
+            <div className="detail-lines">
+              {item.listen ? <span>监听 {item.listen}</span> : null}
+              {item.proxy_url ? <span className="mono">代理 {item.proxy_url}</span> : null}
+              {item.ip ? <span>出口 IP {item.ip}</span> : null}
+              {Number.isFinite(Number(item.latency_ms)) && Number(item.latency_ms) > 0 ? <span>延迟 {item.latency_ms} ms</span> : null}
+              {item.info ? <span>{formatIPInfoSummary(item.info)}</span> : null}
+              {item.error ? <span className="error-text">{item.error}</span> : null}
+            </div>
+          </div>
+        ))}
+      </div>
+      {!results.length && result.error ? <div className="readout">{result.error}</div> : null}
+    </div>
+  );
+}
+
 function NodesPage({
   current,
   busyAction,
@@ -826,12 +937,15 @@ function NodesPage({
   actionMsg,
   onRefreshNodes,
   onTest,
+  onCancelTest,
   onTestBatch,
   onCancelBatchTest,
   onConnect,
+  onDisconnect,
 }) {
   const nodes = current?.nodes || [];
   const listeners = current?.socks5_listeners || [];
+  const listenerBackends = current?.listener_backends || [];
   const batchTesting = Boolean(batchTestActive);
   const cancellingBatchTest = Boolean(batchCancelPending);
   const batchActionActive = batchTesting || cancellingBatchTest;
@@ -907,6 +1021,16 @@ function NodesPage({
         .filter((listener) => listener.key && listener.enabled),
     [listeners],
   );
+  const listenerBackendsByListen = useMemo(() => {
+    const values = new Map();
+    for (const backend of listenerBackends) {
+      const listen = String(backend.listen_address || "").trim();
+      if (listen) {
+        values.set(listen, backend);
+      }
+    }
+    return values;
+  }, [listenerBackends]);
 
   const updateFilter = (field, value) => {
     setFilters((previous) => ({ ...previous, [field]: value }));
@@ -991,9 +1115,13 @@ function NodesPage({
         busyAction={busyAction}
         batchTesting={batchActionActive}
         listenerOptions={listenerOptions}
+        currentConnected={Boolean(current?.connected)}
+        listenerBackendsByListen={listenerBackendsByListen}
         onToggle={toggleNode}
         onTest={onTest}
+        onCancelTest={onCancelTest}
         onConnect={onConnect}
+        onDisconnect={onDisconnect}
       />
       <Pagination
         page={safePage}
@@ -1216,6 +1344,68 @@ function formatIPTypeLabel(type) {
   return ipTypeOptions.find(([value]) => value === type)?.[1] || "未知";
 }
 
+function formatBackendStatus(status) {
+  switch (status) {
+    case "running":
+      return "运行中";
+    case "switching":
+      return "切换中";
+    case "starting":
+      return "启动中";
+    case "error":
+      return "异常";
+    case "stopped":
+      return "已停止";
+    default:
+      return status || "-";
+  }
+}
+
+function proxyResultsFromResponse(result) {
+  if (!result) {
+    return [];
+  }
+  if (Array.isArray(result.results) && result.results.length) {
+    return result.results;
+  }
+  if (result.ip || result.error || result.proxy_url || result.info) {
+    return [result];
+  }
+  return [];
+}
+
+function formatProxyResultTitle(item, index) {
+  return item.listener || item.listen || item.proxy_url || `入口 ${index + 1}`;
+}
+
+function formatIPInfoSummary(info) {
+  if (!info) {
+    return "";
+  }
+  const location = [info.country, info.region, info.city].filter(Boolean).join(" / ");
+  return [
+    formatIPTypeLabel(info.ip_type),
+    info.asn,
+    info.as_organization || info.organization || info.isp,
+    location,
+    Number.isFinite(Number(info.fraud_score)) ? `Fraud ${info.fraud_score}` : "",
+  ]
+    .filter(Boolean)
+    .join(" / ");
+}
+
+function formatProxyTestMessage(result) {
+  const results = proxyResultsFromResponse(result);
+  if (!results.length) {
+    return result?.error || "出口检测完成";
+  }
+  const passed = results.filter((item) => item.ok).length;
+  const total = results.length;
+  const ips = [...new Set(results.map((item) => item.ip).filter(Boolean))];
+  const suffix = ips.length ? `，出口 ${ips.join(", ")}` : result?.error ? `，${result.error}` : "";
+  return `出口检测${result?.ok ? "通过" : "失败"}: ${passed}/${total} 个入口通过${suffix}`;
+}
+
 function includesAny(text, keywords) {
   return keywords.some((keyword) => text.includes(keyword));
 }
@@ -1336,7 +1526,20 @@ function formatExitQualityText(node) {
     .join(" / ");
 }
 
-function NodeList({ nodes, selectedIDs, busyAction, batchTesting, listenerOptions, onToggle, onTest, onConnect }) {
+function NodeList({
+  nodes,
+  selectedIDs,
+  busyAction,
+  batchTesting,
+  listenerOptions,
+  currentConnected,
+  listenerBackendsByListen,
+  onToggle,
+  onTest,
+  onCancelTest,
+  onConnect,
+  onDisconnect,
+}) {
   const defaultListenerKey = listenerOptions[0]?.key || "";
   const [selectedListeners, setSelectedListeners] = useState({});
 
@@ -1379,9 +1582,28 @@ function NodeList({ nodes, selectedIDs, busyAction, batchTesting, listenerOption
         const nodeID = String(node.id || "");
         const hasNodeID = Boolean(nodeID);
         const nodeTesting = node.probe_status === "testing";
-        const nodeActionDisabled = batchTesting || nodeTesting || !hasNodeID;
+        const testDisabled = nodeTesting || !hasNodeID;
         const selectedListener = selectedListeners[nodeID] || defaultListenerKey;
-        const connectDisabled = nodeActionDisabled || !selectedListener;
+        const selectedBackend = listenerBackendsByListen?.get(selectedListener);
+        const listenerHasConnection = Boolean(selectedBackend?.node_id || selectedBackend?.status === "running");
+        const connecting = busyAction === `connect-${nodeID}`;
+        const cancellingTest = busyAction === `cancel-test-${nodeID}`;
+        const connectDisabled = nodeTesting || !hasNodeID || (!node.active && !selectedListener);
+        const connectLabel = node.active ? "断开" : currentConnected ? "切换" : "连接";
+        const connectIcon = node.active ? Power : Play;
+        const handleConnect = () => {
+          if (node.active) {
+            onDisconnect();
+            return;
+          }
+          if (listenerHasConnection && selectedBackend?.node_id !== nodeID) {
+            const currentNode = selectedBackend?.node_id ? `节点 ${selectedBackend.node_id}` : "已有连接";
+            if (!window.confirm(`入口 ${selectedListener} 当前已连接 ${currentNode}。是否切换到节点 ${nodeID}？`)) {
+              return;
+            }
+          }
+          onConnect(nodeID, selectedListener);
+        };
         return (
           <div className={`node-row ${nodeTesting ? "testing" : ""}`} key={node.id || `${node.remote_host}-${node.remote_port}`}>
             <label className="node-check">
@@ -1404,7 +1626,7 @@ function NodeList({ nodes, selectedIDs, busyAction, batchTesting, listenerOption
             <select
               className="node-listener-select"
               value={selectedListener}
-              disabled={nodeActionDisabled || !listenerOptions.length}
+              disabled={nodeTesting || !listenerOptions.length}
               aria-label={`选择节点 ${node.id || node.remote_host || ""} 绑定的 SOCKS5 入口`}
               onChange={(event) => setSelectedListeners((previous) => ({ ...previous, [nodeID]: event.target.value }))}
             >
@@ -1416,8 +1638,12 @@ function NodeList({ nodes, selectedIDs, busyAction, batchTesting, listenerOption
               ))}
             </select>
             <div className="row-actions">
-              <ActionButton icon={Zap} label={nodeTesting ? "测试中" : "测试"} compact busy={busyAction === `test-${nodeID}` || nodeTesting} disabled={nodeActionDisabled} onClick={() => onTest(nodeID)} />
-              <ActionButton icon={Play} label="连接" compact busy={busyAction === `connect-${nodeID}`} disabled={connectDisabled} onClick={() => onConnect(nodeID, selectedListener)} />
+              {nodeTesting ? (
+                <ActionButton icon={CircleX} label="取消" compact danger busy={cancellingTest} onClick={() => onCancelTest(nodeID)} />
+              ) : (
+                <ActionButton icon={Zap} label="测试" compact busy={busyAction === `test-${nodeID}`} disabled={testDisabled} onClick={() => onTest(nodeID)} />
+              )}
+              <ActionButton icon={connectIcon} label={connectLabel} compact danger={node.active} busy={connecting || (node.active && busyAction === "disconnect")} disabled={connectDisabled} onClick={handleConnect} />
             </div>
           </div>
         );

@@ -32,9 +32,9 @@ const (
 	sessionCookieName    = "akiragate_session"
 	defaultIPPureInfoURL = "https://my.ippure.com/v1/info"
 	maxBatchNodeTests    = 8
-	maxBatchTestWorkers  = 8
-	batchProbeTimeout    = gatewayconfig.DefaultHandshakeTimeout * 70 / 100
-	batchProbeGraceTime  = 15 * time.Second
+	maxBatchTestWorkers  = 128
+	batchProbeTimeout    = 45 * time.Second
+	batchProbeGraceTime  = 5 * time.Second
 	exitInfoRequestLimit = 16 * 1024
 	probeStatusTesting   = "testing"
 	healthCheckInterval  = 60 * time.Second
@@ -54,6 +54,13 @@ type nodeTestResult struct {
 
 type nodeProbeFunc func(context.Context, string) (vpngate.Node, error)
 
+type nodeTestToken struct{}
+
+type nodeTestCancel struct {
+	cancel context.CancelFunc
+	token  *nodeTestToken
+}
+
 type listenerWorkerResult struct {
 	Listener gatewayconfig.Listener
 	Err      error
@@ -69,7 +76,9 @@ type listenerBackendPlan struct {
 }
 
 type batchNodeTest struct {
-	cancel context.CancelFunc
+	cancel         context.CancelFunc
+	nodeIDs        map[string]struct{}
+	cancelledNodes map[string]struct{}
 }
 
 type Server struct {
@@ -88,6 +97,7 @@ type Server struct {
 	nodes        []vpngate.Node
 	failed       map[string]string
 	batchTest    *batchNodeTest
+	nodeTests    map[string]nodeTestCancel
 }
 
 type authSession struct {
@@ -210,6 +220,7 @@ func NewServer(configPath string, config Config, logger *slog.Logger, logBuffer 
 		webRoot:      defaultWebRoot(),
 		authSessions: map[string]authSession{},
 		failed:       map[string]string{},
+		nodeTests:    map[string]nodeTestCancel{},
 	}
 }
 
@@ -344,6 +355,11 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.cancelTestNodes(w)
+	case r.Method == http.MethodPost && path == "/api/cancel_test_node":
+		if !s.requireAuth(w, r) {
+			return
+		}
+		s.cancelTestNode(w, r)
 	case r.Method == http.MethodPost && path == "/api/disconnect":
 		if !s.requireAuth(w, r) {
 			return
@@ -791,11 +807,6 @@ func (s *Server) connect(w http.ResponseWriter, r *http.Request) {
 	payload.ListenAddress = strings.TrimSpace(payload.ListenAddress)
 
 	s.mu.Lock()
-	if s.session != nil {
-		s.mu.Unlock()
-		s.sendError(w, http.StatusConflict, "当前已有活动连接，请先断开")
-		return
-	}
 	config := s.config
 	nodeID := ""
 	if payload.NodeID != "" {
@@ -836,9 +847,6 @@ func (s *Server) connect(w http.ResponseWriter, r *http.Request) {
 			}
 			config.OpenVPNConfig = path
 			nodeID = payload.NodeID
-			for idx := range s.nodes {
-				s.nodes[idx].Active = s.nodes[idx].ID == payload.NodeID
-			}
 		}
 	} else {
 		if config.OpenVPNConfig == "" {
@@ -851,6 +859,13 @@ func (s *Server) connect(w http.ResponseWriter, r *http.Request) {
 			s.mu.Unlock()
 			s.sendError(w, http.StatusBadRequest, fmt.Sprintf("OpenVPN 配置不可读: %v", err))
 			return
+		}
+	}
+	previousSession := s.session
+	if previousSession != nil {
+		previousSession.cancel()
+		for idx := range s.nodes {
+			s.nodes[idx].Active = false
 		}
 	}
 	sessionCtx, cancel := context.WithCancel(context.Background())
@@ -867,7 +882,11 @@ func (s *Server) connect(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 
 	go s.runSession(sessionCtx, session)
-	s.sendJSON(w, map[string]any{"ok": true, "message": "连接流程已启动"})
+	message := "连接流程已启动"
+	if previousSession != nil {
+		message = "已切换连接，新的连接流程已启动"
+	}
+	s.sendJSON(w, map[string]any{"ok": true, "message": message, "switched": previousSession != nil})
 }
 
 func (s *Server) refreshNodes(w http.ResponseWriter) {
@@ -1015,6 +1034,7 @@ func (s *Server) testNodes(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.finishBatchNodeTest(batch)
 
+	s.setBatchNodeTestIDs(batch, nodeIDs)
 	s.markBatchNodesProbeTesting(nodeIDs)
 	results, cancelled := s.probeNodesConcurrently(testCtx, nodeIDs)
 	s.sendJSON(w, map[string]any{"ok": true, "cancelled": cancelled, "nodes": results})
@@ -1028,6 +1048,37 @@ func (s *Server) cancelTestNodes(w http.ResponseWriter) {
 	s.sendJSON(w, map[string]any{"ok": true, "cancelled": false, "message": "当前没有正在运行的批量测试"})
 }
 
+func (s *Server) cancelTestNode(w http.ResponseWriter, r *http.Request) {
+	var payload struct {
+		NodeID string `json:"node_id"`
+		ID     string `json:"id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil && !errors.Is(err, io.EOF) {
+		s.sendError(w, http.StatusBadRequest, "请求 JSON 无效")
+		return
+	}
+	nodeID := strings.TrimSpace(payload.NodeID)
+	if nodeID == "" {
+		nodeID = strings.TrimSpace(payload.ID)
+	}
+	if nodeID == "" {
+		s.sendError(w, http.StatusBadRequest, "节点 ID 不能为空")
+		return
+	}
+	if node, cancelled := s.cancelNodeTest(nodeID); cancelled {
+		s.sendJSON(w, map[string]any{"ok": true, "cancelled": true, "node": node, "message": "已请求取消节点测试"})
+		return
+	}
+	s.mu.Lock()
+	_, exists := s.findNodeLocked(nodeID)
+	s.mu.Unlock()
+	if !exists {
+		s.sendError(w, http.StatusNotFound, "节点不存在，请先刷新节点列表")
+		return
+	}
+	s.sendJSON(w, map[string]any{"ok": true, "cancelled": false, "message": "该节点当前没有正在运行的测试"})
+}
+
 func (s *Server) startBatchNodeTest() (context.Context, *batchNodeTest, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1035,9 +1086,31 @@ func (s *Server) startBatchNodeTest() (context.Context, *batchNodeTest, bool) {
 		return nil, nil, false
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	batch := &batchNodeTest{cancel: cancel}
+	batch := &batchNodeTest{
+		cancel:         cancel,
+		nodeIDs:        map[string]struct{}{},
+		cancelledNodes: map[string]struct{}{},
+	}
 	s.batchTest = batch
 	return ctx, batch, true
+}
+
+func (s *Server) setBatchNodeTestIDs(batch *batchNodeTest, nodeIDs []string) {
+	if batch == nil {
+		return
+	}
+	nodeSet := make(map[string]struct{}, len(nodeIDs))
+	for _, nodeID := range nodeIDs {
+		nodeID = strings.TrimSpace(nodeID)
+		if nodeID != "" {
+			nodeSet[nodeID] = struct{}{}
+		}
+	}
+	s.mu.Lock()
+	if s.batchTest == batch {
+		batch.nodeIDs = nodeSet
+	}
+	s.mu.Unlock()
 }
 
 func (s *Server) finishBatchNodeTest(batch *batchNodeTest) {
@@ -1074,11 +1147,10 @@ func batchProbeWorkerCount(nodeCount int) int {
 	if nodeCount <= 0 {
 		return 0
 	}
-	workerCount := maxBatchTestWorkers
-	if workerCount > nodeCount {
-		workerCount = nodeCount
+	if nodeCount > maxBatchTestWorkers {
+		return maxBatchTestWorkers
 	}
-	return workerCount
+	return nodeCount
 }
 
 func batchProbeWatchdogTimeout(nodeCount int, workerCount int) time.Duration {
@@ -1099,7 +1171,7 @@ func (s *Server) probeNodesConcurrentlyWith(ctx context.Context, nodeIDs []strin
 	if workerCount <= 0 || workerCount > len(nodeIDs) {
 		workerCount = batchProbeWorkerCount(len(nodeIDs))
 	}
-	jobs := make(chan nodeTestJob)
+	jobs := make(chan nodeTestJob, len(nodeIDs))
 	resultCh := make(chan nodeTestResult, len(nodeIDs))
 	queuedCh := make(chan int, 1)
 
@@ -1118,6 +1190,16 @@ func (s *Server) probeNodesConcurrentlyWith(ctx context.Context, nodeIDs []strin
 			queuedCh <- queued
 		}()
 		for idx, nodeID := range nodeIDs {
+			if s.isBatchNodeCancelled(nodeID) {
+				resultCh <- nodeTestResult{
+					Index:  idx,
+					NodeID: nodeID,
+					Node:   s.markNodeProbeCancelled(nodeID),
+					Err:    context.Canceled,
+				}
+				queued++
+				continue
+			}
 			select {
 			case <-ctx.Done():
 				return
@@ -1170,7 +1252,16 @@ func (s *Server) probeNodesConcurrentlyWith(ctx context.Context, nodeIDs []strin
 
 func (s *Server) probeNodeTestJob(ctx context.Context, job nodeTestJob, probe nodeProbeFunc) (result nodeTestResult) {
 	result = nodeTestResult{Index: job.Index, NodeID: job.NodeID}
+	if s.isBatchNodeCancelled(job.NodeID) {
+		result.Node = s.markNodeProbeCancelled(job.NodeID)
+		result.Err = context.Canceled
+		return result
+	}
+	probeCtx, cancel := context.WithCancel(ctx)
+	token := s.registerNodeTest(job.NodeID, cancel)
 	defer func() {
+		cancel()
+		s.unregisterNodeTest(job.NodeID, token)
 		if recovered := recover(); recovered != nil {
 			message := fmt.Sprintf("节点测试异常: %v", recovered)
 			s.logger.Error("节点测试发生 panic", "node", job.NodeID, "panic", recovered)
@@ -1178,8 +1269,93 @@ func (s *Server) probeNodeTestJob(ctx context.Context, job nodeTestJob, probe no
 			result.Err = errors.New(message)
 		}
 	}()
-	result.Node, result.Err = probe(ctx, job.NodeID)
+	result.Node, result.Err = probe(probeCtx, job.NodeID)
+	if err := probeCtx.Err(); err != nil {
+		result.Node = s.markInterruptedNodeProbe(job.NodeID, err)
+		result.Err = err
+	}
 	return result
+}
+
+func (s *Server) registerNodeTest(nodeID string, cancel context.CancelFunc) *nodeTestToken {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" || cancel == nil {
+		return nil
+	}
+	token := &nodeTestToken{}
+	s.mu.Lock()
+	s.nodeTests[nodeID] = nodeTestCancel{cancel: cancel, token: token}
+	s.mu.Unlock()
+	return token
+}
+
+func (s *Server) unregisterNodeTest(nodeID string, token *nodeTestToken) {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" || token == nil {
+		return
+	}
+	s.mu.Lock()
+	if current := s.nodeTests[nodeID]; current.token == token {
+		delete(s.nodeTests, nodeID)
+	}
+	s.mu.Unlock()
+}
+
+func (s *Server) cancelNodeTest(nodeID string) (vpngate.Node, bool) {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return vpngate.Node{}, false
+	}
+	s.mu.Lock()
+	test := s.nodeTests[nodeID]
+	batch := s.batchTest
+	batchContainsNode := false
+	nodeIndex := -1
+	for idx := range s.nodes {
+		if s.nodes[idx].ID == nodeID {
+			nodeIndex = idx
+			break
+		}
+	}
+	nodeTesting := nodeIndex >= 0 && s.nodes[nodeIndex].ProbeStatus == probeStatusTesting
+	if batch != nil {
+		_, batchContainsNode = batch.nodeIDs[nodeID]
+		if batchContainsNode && nodeTesting {
+			if batch.cancelledNodes == nil {
+				batch.cancelledNodes = map[string]struct{}{}
+			}
+			batch.cancelledNodes[nodeID] = struct{}{}
+		}
+	}
+	if !nodeTesting || (test.cancel == nil && !batchContainsNode) {
+		s.mu.Unlock()
+		return vpngate.Node{}, false
+	}
+	s.nodes[nodeIndex].ProbeStatus = "cancelled"
+	s.nodes[nodeIndex].ProbeMessage = "批量测试已取消"
+	s.nodes[nodeIndex].ProbeLatency = 0
+	s.nodes[nodeIndex].ExitIPInfo = nil
+	delete(s.failed, nodeID)
+	node := s.nodes[nodeIndex]
+	s.mu.Unlock()
+	if test.cancel != nil {
+		test.cancel()
+	}
+	return node, true
+}
+
+func (s *Server) isBatchNodeCancelled(nodeID string) bool {
+	nodeID = strings.TrimSpace(nodeID)
+	if nodeID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.batchTest == nil {
+		return false
+	}
+	_, cancelled := s.batchTest.cancelledNodes[nodeID]
+	return cancelled
 }
 
 func (s *Server) drainReadyNodeTestResults(resultCh <-chan nodeTestResult, results []vpngate.Node, completedNodes []bool) int {
@@ -1292,6 +1468,9 @@ func (s *Server) probeNodeWithTimeout(ctx context.Context, nodeID string, handsh
 	defer s.mu.Unlock()
 	for idx := range s.nodes {
 		if s.nodes[idx].ID == nodeID {
+			if s.nodes[idx].ProbeStatus == "cancelled" {
+				return s.nodes[idx], context.Canceled
+			}
 			s.nodes[idx].ProbeStatus = status
 			s.nodes[idx].ProbeMessage = message
 			s.nodes[idx].ProbeLatency = latency
@@ -1477,6 +1656,9 @@ func (s *Server) runListenerWorker(ctx context.Context, session *Session, listen
 			}
 			retry++
 			continue
+		}
+		if plan.StaticConfig && plan.NodeID == "" && session.nodeID != "" {
+			plan.NodeID = session.nodeID
 		}
 
 		err = s.serveListenerBackend(ctx, session, listener, plan)
@@ -1770,15 +1952,17 @@ func (s *Server) finishSession(session *Session, status string, message string) 
 		session.status = status
 		session.message = message
 		s.session = nil
-	}
-	s.recomputeActiveNodesLocked(nil)
-	s.logger.Info("用户态会话结束", "status", status, "message", message)
-	if status == "error" {
-		if session.nodeID != "" {
-			s.failed[session.nodeID] = message
+		s.recomputeActiveNodesLocked(nil)
+		s.logger.Info("用户态会话结束", "status", status, "message", message)
+		if status == "error" {
+			if session.nodeID != "" {
+				s.failed[session.nodeID] = message
+			}
+			go s.tryAutoConnect()
 		}
-		go s.tryAutoConnect()
+		return
 	}
+	s.logger.Info("旧用户态会话已退出", "status", status, "message", message)
 }
 
 func (s *Server) maintenanceLoop(ctx context.Context) {
