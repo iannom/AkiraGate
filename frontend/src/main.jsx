@@ -259,6 +259,17 @@ function parseCIDRInput(value) {
     .filter(Boolean);
 }
 
+function normalizeText(value) {
+  return String(value ?? "").trim();
+}
+
+function normalizeTextList(values) {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+  return values.map((item) => normalizeText(item)).filter(Boolean);
+}
+
 function formatListenAddress(listener) {
   const host = String(listener?.host || "127.0.0.1").trim();
   const port = Number(listener?.port || 0);
@@ -273,6 +284,164 @@ function listenerDisplayName(listener, index) {
   const name = String(listener?.name || `socks${index + 1}`).trim();
   const address = formatListenAddress(listener);
   return address ? `${name} (${address})` : name;
+}
+
+function listenerBackendPolicyEnabled(listener) {
+  if (!listener) {
+    return false;
+  }
+  if (listener.backend_policy_enabled === true) {
+    return true;
+  }
+  if (listener.backend_policy_enabled === false) {
+    return false;
+  }
+  return Boolean(
+    normalizeText(listener.country_code) ||
+      normalizeText(listener.fixed_node_id) ||
+      normalizeTextList(listener.entry_cidrs).length,
+  );
+}
+
+function formatOverviewStatus(current) {
+  if (!current) {
+    return "加载中";
+  }
+  const status = normalizeText(current.status);
+  return status ? formatBackendStatus(status) : statusText(current);
+}
+
+function formatListenerOverviewSummary(current) {
+  if (!current) {
+    return "加载中";
+  }
+
+  const listeners = Array.isArray(current.socks5_listeners) ? current.socks5_listeners : [];
+  const backends = Array.isArray(current.listener_backends) ? current.listener_backends : [];
+  if (!listeners.length) {
+    return "未配置 SOCKS5 入口";
+  }
+
+  const enabledCount = listeners.filter((listener) => listener?.enabled !== false).length;
+  const runningCount = backends.filter((backend) => backend?.status === "running").length;
+  const errorCount = backends.filter((backend) => backend?.status === "error" || backend?.error).length;
+  const parts = [`共 ${listeners.length} 个入口`, `${enabledCount} 个启用`, `${runningCount} 个运行`];
+  if (errorCount) {
+    parts.push(`${errorCount} 个异常`);
+  }
+  return parts.join(" / ");
+}
+
+function findBackendForListener(listener, index, backendIndexes) {
+  const listenAddress = formatListenAddress(listener);
+  const listenerName = normalizeText(listener?.name || `socks${index + 1}`);
+  return (
+    (listenAddress ? backendIndexes.byListenAddress.get(listenAddress) : null) ||
+    (listenerName ? backendIndexes.byListenerName.get(listenerName) : null) ||
+    null
+  );
+}
+
+function formatListenerPolicy(listener, backend, entryCIDRs) {
+  const safeEntryCIDRs = Array.isArray(entryCIDRs) ? entryCIDRs : [];
+  const countryCode = normalizeText(backend?.country_code || listener?.country_code).toUpperCase();
+  const fixedNodeID = normalizeText(listener?.fixed_node_id);
+  const hasPolicy = listenerBackendPolicyEnabled(listener) || countryCode || fixedNodeID || safeEntryCIDRs.length;
+  if (!hasPolicy) {
+    return "自动选择";
+  }
+
+  const parts = [];
+  if (countryCode) {
+    parts.push(`国家 ${countryCode}`);
+  }
+  if (fixedNodeID) {
+    parts.push(`固定节点 ${fixedNodeID}`);
+  }
+  if (safeEntryCIDRs.length) {
+    parts.push(`入口网段 ${safeEntryCIDRs.join(", ")}`);
+  }
+  return parts.length ? parts.join(" / ") : "已开启";
+}
+
+function formatListenerOverviewMessage(backend, status, connected) {
+  const error = normalizeText(backend?.error);
+  if (error) {
+    return error;
+  }
+
+  const message = normalizeText(backend?.message);
+  if (message) {
+    return message;
+  }
+
+  switch (status) {
+    case "disabled":
+      return "入口已停用";
+    case "running":
+      return "入口后端运行正常";
+    case "switching":
+      return "入口后端正在切换";
+    case "starting":
+      return "入口后端正在启动";
+    case "stopped":
+      return connected ? "入口后端已停止" : "网关未连接";
+    default:
+      return connected ? "等待后端上报状态" : "网关未连接";
+  }
+}
+
+function buildListenerOverviewItem(listener, backend, index, connected) {
+  const listenerName = normalizeText(listener?.name || backend?.listener_name) || `socks${index + 1}`;
+  const listenAddress = normalizeText(backend?.listen_address) || formatListenAddress(listener);
+  const backendEntryCIDRs = normalizeTextList(backend?.entry_cidrs);
+  const listenerEntryCIDRs = normalizeTextList(listener?.entry_cidrs);
+  const entryCIDRs = backendEntryCIDRs.length ? backendEntryCIDRs : listenerEntryCIDRs;
+  const enabled = listener ? listener.enabled !== false : true;
+  const status = enabled ? normalizeText(backend?.status) || (connected ? "starting" : "stopped") : "disabled";
+
+  return {
+    key: `${listenAddress || listenerName}-${index}`,
+    title: listenerName,
+    listenAddress: listenAddress || "-",
+    proxyURL: normalizeText(backend?.proxy_url),
+    status,
+    message: formatListenerOverviewMessage(backend, status, connected),
+    hasError: Boolean(normalizeText(backend?.error)),
+    policy: formatListenerPolicy(listener, backend, entryCIDRs),
+    nodeID: normalizeText(backend?.node_id),
+    entryIP: normalizeText(backend?.entry_ip),
+    exitIP: normalizeText(backend?.exit_ip),
+  };
+}
+
+function listenerOverviewItems(current) {
+  const listeners = Array.isArray(current?.socks5_listeners) ? current.socks5_listeners : [];
+  const backends = Array.isArray(current?.listener_backends) ? current.listener_backends : [];
+  const connected = Boolean(current?.connected);
+  const backendIndexes = {
+    byListenAddress: new Map(),
+    byListenerName: new Map(),
+  };
+
+  for (const backend of backends) {
+    const listenAddress = normalizeText(backend?.listen_address);
+    const listenerName = normalizeText(backend?.listener_name);
+    if (listenAddress && !backendIndexes.byListenAddress.has(listenAddress)) {
+      backendIndexes.byListenAddress.set(listenAddress, backend);
+    }
+    if (listenerName && !backendIndexes.byListenerName.has(listenerName)) {
+      backendIndexes.byListenerName.set(listenerName, backend);
+    }
+  }
+
+  if (listeners.length) {
+    return listeners.map((listener, index) =>
+      buildListenerOverviewItem(listener, findBackendForListener(listener, index, backendIndexes), index, connected),
+    );
+  }
+
+  return backends.map((backend, index) => buildListenerOverviewItem(null, backend, index, connected));
 }
 
 function apiBaseFromConfig(config) {
@@ -832,18 +1001,21 @@ function App() {
 }
 
 function OverviewPage({ current, runtimeWeb, restartHint, actionMsg, busyAction, proxyTestResult, onConnect, onDisconnect, onTestProxy, onRefresh }) {
+  const localProxyURLs = Array.isArray(current?.local_proxy_urls) ? current.local_proxy_urls : [];
   return (
     <section className="panel">
       <SectionTitle icon={Activity} title="连接概览" />
       <div className="field-grid">
-        <Readout label="状态" value={current?.message || current?.status || "-"} />
+        <Readout label="连接状态" value={formatOverviewStatus(current)} />
+        <Readout label="入口概况" value={formatListenerOverviewSummary(current)} />
         <Readout
           label="本地代理地址"
-          value={(current?.local_proxy_urls || []).length ? current.local_proxy_urls : ["-"]}
+          value={localProxyURLs.length ? localProxyURLs : ["-"]}
           mono
         />
         <Readout label="当前 Web 监听" value={runtimeWeb} mono />
         <Readout label="配置生效状态" value={restartHint} />
+        <Readout label="状态说明" value={current?.message || "-"} />
       </div>
       <ListenerBackendOverview current={current} />
       <ProxyTestDetails result={proxyTestResult} />
@@ -859,38 +1031,49 @@ function OverviewPage({ current, runtimeWeb, restartHint, actionMsg, busyAction,
 }
 
 function ListenerBackendOverview({ current }) {
-  const backends = current?.listener_backends || [];
-  if (!backends.length) {
+  const entries = listenerOverviewItems(current);
+  if (!entries.length) {
     return (
       <div className="overview-section">
         <label>SOCKS5 入口连接</label>
-        <div className="readout">暂无运行中的入口后端状态。</div>
+        <div className="readout">{current ? "暂无 SOCKS5 入口配置。" : "正在加载入口状态。"}</div>
       </div>
     );
   }
   return (
     <div className="overview-section">
-      <label>SOCKS5 入口连接</label>
+      <div className="overview-title-line">
+        <label>SOCKS5 入口连接</label>
+        <span className="muted">{entries.length} 个入口</span>
+      </div>
       <div className="backend-grid">
-        {backends.map((backend) => (
-          <div className="backend-card" key={backend.listen_address || backend.listener_name}>
+        {entries.map((entry) => (
+          <div className={`backend-card ${entry.hasError ? "is-error" : entry.status === "disabled" ? "is-disabled" : ""}`} key={entry.key}>
             <div className="backend-head">
-              <strong>{backend.listener_name || backend.listen_address || "-"}</strong>
-              <span className={`badge ${backend.status === "running" ? "ok" : backend.status === "error" ? "err" : ""}`}>{formatBackendStatus(backend.status)}</span>
+              <strong>{entry.title}</strong>
+              <span className={`badge ${backendStatusBadgeClass(entry.status)}`}>{formatBackendStatus(entry.status)}</span>
             </div>
-            <div className="detail-lines">
-              <span>监听 {backend.listen_address || "-"}</span>
-              {backend.node_id ? <span>节点 {backend.node_id}</span> : null}
-              {backend.entry_ip ? <span>入口 IP {backend.entry_ip}</span> : null}
-              {backend.exit_ip ? <span>出口 IP {backend.exit_ip}</span> : null}
-              {backend.country_code ? <span>国家 {backend.country_code}</span> : null}
-              {backend.entry_cidrs?.length ? <span>入口网段 {backend.entry_cidrs.join(", ")}</span> : null}
-              {backend.proxy_url ? <span className="mono">代理 {backend.proxy_url}</span> : null}
-              {backend.error ? <span className="error-text">{backend.error}</span> : <span>{backend.message || "-"}</span>}
+            <div className="backend-detail-grid">
+              <BackendDetailItem label="监听地址" value={entry.listenAddress} mono />
+              <BackendDetailItem label="代理地址" value={entry.proxyURL || "-"} mono />
+              <BackendDetailItem label="绑定策略" value={entry.policy} />
+              <BackendDetailItem label="当前节点" value={entry.nodeID || "-"} mono />
+              <BackendDetailItem label="入口 IP" value={entry.entryIP || "-"} mono />
+              <BackendDetailItem label="出口 IP" value={entry.exitIP || "-"} mono />
+              <BackendDetailItem label={entry.hasError ? "错误" : "说明"} value={entry.message} danger={entry.hasError} wide />
             </div>
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+function BackendDetailItem({ label, value, mono = false, danger = false, wide = false }) {
+  return (
+    <div className={`backend-detail ${wide ? "wide" : ""}`}>
+      <span className="backend-detail-label">{label}</span>
+      <span className={`backend-detail-value ${mono ? "mono" : ""} ${danger ? "danger" : ""}`}>{value || "-"}</span>
     </div>
   );
 }
@@ -1344,6 +1527,20 @@ function formatIPTypeLabel(type) {
   return ipTypeOptions.find(([value]) => value === type)?.[1] || "未知";
 }
 
+function backendStatusBadgeClass(status) {
+  switch (status) {
+    case "running":
+      return "ok";
+    case "error":
+      return "err";
+    case "switching":
+    case "starting":
+      return "warn";
+    default:
+      return "";
+  }
+}
+
 function formatBackendStatus(status) {
   switch (status) {
     case "running":
@@ -1356,6 +1553,8 @@ function formatBackendStatus(status) {
       return "异常";
     case "stopped":
       return "已停止";
+    case "disabled":
+      return "已停用";
     default:
       return status || "-";
   }

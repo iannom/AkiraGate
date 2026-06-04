@@ -291,6 +291,14 @@ h2 {
   padding: 10px;
 }
 
+.backend-card.is-error {
+  border-color: #7f1d1d;
+}
+
+.backend-card.is-disabled {
+  background: #111317;
+}
+
 .backend-head {
   display: flex;
   align-items: center;
@@ -304,6 +312,38 @@ h2 {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.backend-detail-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.backend-detail {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.backend-detail.wide {
+  grid-column: 1 / -1;
+}
+
+.backend-detail-label {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.backend-detail-value {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font-size: 12px;
+}
+
+.backend-detail-value.danger {
+  color: #fecdd3;
 }
 
 .detail-lines {
@@ -441,6 +481,12 @@ h2 {
   color: #fecdd3;
   border-color: #7f1d1d;
   background: var(--danger-soft);
+}
+
+.badge.warn {
+  color: #fde68a;
+  border-color: #92400e;
+  background: rgba(146, 64, 14, 0.28);
 }
 
 .list-scroll {
@@ -760,5 +806,9 @@ h2 {
   .pagination-controls {
     width: 100%;
     flex-wrap: wrap;
+  }
+
+  .backend-detail-grid {
+    grid-template-columns: 1fr;
   }
 }
