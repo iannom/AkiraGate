@@ -2,12 +2,19 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
+  ArrowUpDown,
   CircleX,
   CheckSquare,
+  ClipboardList,
   LogOut,
   CirclePlus,
   ChevronsLeft,
   ChevronsRight,
+  Copy,
+  CopyCheck,
+  Dices,
+  Eye,
+  EyeOff,
   Globe2,
   ListRestart,
   LoaderCircle,
@@ -117,6 +124,28 @@ const ipTypeOptions = [
   ["proxy", "代理/VPN"],
   ["datacenter", "数据中心"],
 ];
+const nodeSortColumns = Object.freeze([
+  { key: "country", label: "国家" },
+  { key: "endpoint", label: "节点地址" },
+  { key: "probe", label: "状态" },
+  { key: "exit", label: "真实出口测试" },
+  { key: "network", label: "ASN / 运营商" },
+]);
+const nodeSortColumnKeys = new Set(nodeSortColumns.map((column) => column.key));
+const defaultNodeSort = Object.freeze({ key: "", direction: "asc" });
+const nodeSortDirectionLabels = Object.freeze({ asc: "升序", desc: "降序" });
+const nodeSortCollator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
+const nodeProbeStatusRank = Object.freeze({
+  available: 0,
+  testing: 1,
+  not_checked: 2,
+  cancelled: 3,
+  unavailable: 4,
+});
+const socksCredentialUsernameAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+const socksCredentialPasswordAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.~";
+const socksCredentialUsernameLength = 12;
+const socksCredentialPasswordLength = 24;
 
 const localFlagUrls = Object.freeze({
   jp: flagJpUrl,
@@ -143,9 +172,249 @@ function formatFlagFallbackText(code) {
   return fallback || "--";
 }
 
+function getCryptoRandomValues(buffer) {
+  const cryptoSource = globalThis.crypto;
+  if (!cryptoSource || typeof cryptoSource.getRandomValues !== "function") {
+    throw new Error("当前浏览器不支持安全随机数生成。");
+  }
+  cryptoSource.getRandomValues(buffer);
+  return buffer;
+}
+
+function randomString(length, alphabet) {
+  if (!Number.isInteger(length) || length <= 0) {
+    throw new Error("随机字符串长度必须是正整数。");
+  }
+  if (typeof alphabet !== "string" || alphabet.length < 2 || alphabet.length > 256) {
+    throw new Error("随机字符串字符集无效。");
+  }
+
+  const output = [];
+  const maxAcceptedByte = Math.floor(256 / alphabet.length) * alphabet.length;
+  while (output.length < length) {
+    const bytes = getCryptoRandomValues(new Uint8Array(length - output.length));
+    for (const byte of bytes) {
+      if (byte >= maxAcceptedByte) {
+        continue;
+      }
+      output.push(alphabet[byte % alphabet.length]);
+      if (output.length === length) {
+        break;
+      }
+    }
+  }
+  return output.join("");
+}
+
+function generateSocksCredentials() {
+  return {
+    username: `u_${randomString(socksCredentialUsernameLength, socksCredentialUsernameAlphabet)}`,
+    password: randomString(socksCredentialPasswordLength, socksCredentialPasswordAlphabet),
+  };
+}
+
+async function copyTextToClipboard(text) {
+  const value = String(text ?? "");
+  if (!value) {
+    throw new Error("没有可复制的内容。");
+  }
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  if (typeof document === "undefined" || typeof document.execCommand !== "function") {
+    throw new Error("当前浏览器不支持复制到剪贴板。");
+  }
+  if (!document.body) {
+    throw new Error("当前页面暂时无法复制到剪贴板。");
+  }
+
+  const textArea = document.createElement("textarea");
+  textArea.value = value;
+  textArea.setAttribute("readonly", "");
+  textArea.style.position = "fixed";
+  textArea.style.left = "-9999px";
+  textArea.style.top = "0";
+  document.body.appendChild(textArea);
+  try {
+    textArea.select();
+    const copied = document.execCommand("copy");
+    if (!copied) {
+      throw new Error("复制到剪贴板失败。");
+    }
+  } finally {
+    document.body.removeChild(textArea);
+  }
+}
+
+function normalizeNodeSortKey(key) {
+  const normalized = String(key || "");
+  return nodeSortColumnKeys.has(normalized) ? normalized : "";
+}
+
+function normalizeNodeSortDirection(direction) {
+  return direction === "desc" ? "desc" : "asc";
+}
+
+function compareTextValue(left, right) {
+  return nodeSortCollator.compare(String(left ?? "").trim(), String(right ?? "").trim());
+}
+
+function compareNumberValue(left, right) {
+  const leftNumber = Number(left);
+  const rightNumber = Number(right);
+  const leftValid = Number.isFinite(leftNumber);
+  const rightValid = Number.isFinite(rightNumber);
+  if (leftValid && rightValid) {
+    return leftNumber - rightNumber;
+  }
+  if (leftValid) {
+    return -1;
+  }
+  if (rightValid) {
+    return 1;
+  }
+  return 0;
+}
+
+function nodeCountrySortText(node) {
+  return node?.country || node?.country_short || "";
+}
+
+function nodeProbeSortRank(node) {
+  const status = String(node?.probe_status || "not_checked").trim() || "not_checked";
+  if (status !== "not_checked" && status !== "testing" && status !== "cancelled" && status !== "unavailable") {
+    return nodeProbeStatusRank.available;
+  }
+  return nodeProbeStatusRank[status] ?? Number.MAX_SAFE_INTEGER;
+}
+
+function compareNodeProbeStatus(left, right) {
+  const rankCompare = compareNumberValue(nodeProbeSortRank(left), nodeProbeSortRank(right));
+  if (rankCompare) {
+    return rankCompare;
+  }
+  const latencyCompare = compareNumberValue(left?.probe_latency_ms, right?.probe_latency_ms);
+  if (latencyCompare) {
+    return latencyCompare;
+  }
+  return compareTextValue(formatProbeStatus(left || {}), formatProbeStatus(right || {}));
+}
+
+function compareNodeExitQuality(left, right) {
+  const fraudCompare = compareNumberValue(left?.exit_ip_info?.fraud_score, right?.exit_ip_info?.fraud_score);
+  if (fraudCompare) {
+    return fraudCompare;
+  }
+  const typeCompare = compareTextValue(
+    formatIPTypeLabel(left?.exit_ip_info?.ip_type),
+    formatIPTypeLabel(right?.exit_ip_info?.ip_type),
+  );
+  if (typeCompare) {
+    return typeCompare;
+  }
+  return compareTextValue(formatExitQualityText(left || {}), formatExitQualityText(right || {}));
+}
+
+function compareNodeNetwork(left, right) {
+  return compareTextValue(formatIPNetworkText(left?.exit_ip_info), formatIPNetworkText(right?.exit_ip_info));
+}
+
+function compareNodeBySortKey(left, right, key) {
+  switch (key) {
+    case "endpoint":
+      return (
+        compareTextValue(left?.remote_host || left?.ip, right?.remote_host || right?.ip) ||
+        compareNumberValue(left?.remote_port, right?.remote_port)
+      );
+    case "probe":
+      return compareNodeProbeStatus(left, right);
+    case "exit":
+      return compareNodeExitQuality(left, right);
+    case "network":
+      return compareNodeNetwork(left, right);
+    case "country":
+    default:
+      return compareTextValue(nodeCountrySortText(left), nodeCountrySortText(right));
+  }
+}
+
+function compareNodeFallback(left, right) {
+  return (
+    compareTextValue(nodeCountrySortText(left), nodeCountrySortText(right)) ||
+    compareTextValue(formatEndpoint(left || {}), formatEndpoint(right || {})) ||
+    compareTextValue(left?.id, right?.id)
+  );
+}
+
+function sortNodes(nodes, sort) {
+  if (!Array.isArray(nodes) || nodes.length === 0) {
+    return [];
+  }
+  const key = normalizeNodeSortKey(sort?.key);
+  if (!key) {
+    return nodes;
+  }
+  const direction = normalizeNodeSortDirection(sort?.direction);
+  const multiplier = direction === "desc" ? -1 : 1;
+  return nodes
+    .map((node, index) => ({ node, index }))
+    .sort((left, right) => {
+      const primaryCompare = compareNodeBySortKey(left.node, right.node, key);
+      if (primaryCompare) {
+        return primaryCompare * multiplier;
+      }
+      const fallbackCompare = compareNodeFallback(left.node, right.node);
+      return fallbackCompare ? fallbackCompare * multiplier : left.index - right.index;
+    })
+    .map((item) => item.node);
+}
+
 function isNodeTestAction(actionName) {
   const name = String(actionName || "");
   return name === "test-nodes" || (name.startsWith("test-") && name !== "test-proxy");
+}
+
+function hasNodeProbeResult(node) {
+  const status = String(node?.probe_status || "").trim();
+  return status !== "" && status !== "not_checked";
+}
+
+function mergeStateWithPreviousNodeResults(nextState, previousState) {
+  if (!nextState || !Array.isArray(nextState.nodes) || !Array.isArray(previousState?.nodes)) {
+    return nextState;
+  }
+
+  const previousNodes = new Map();
+  for (const node of previousState.nodes) {
+    if (node?.id && hasNodeProbeResult(node)) {
+      previousNodes.set(node.id, node);
+    }
+  }
+  if (!previousNodes.size) {
+    return nextState;
+  }
+
+  let changed = false;
+  const nodes = nextState.nodes.map((node) => {
+    if (!node?.id || hasNodeProbeResult(node)) {
+      return node;
+    }
+    const previous = previousNodes.get(node.id);
+    if (!previous) {
+      return node;
+    }
+    changed = true;
+    return {
+      ...node,
+      probe_status: previous.probe_status,
+      probe_message: previous.probe_message,
+      probe_latency_ms: previous.probe_latency_ms,
+      exit_ip_info: previous.exit_ip_info,
+    };
+  });
+
+  return changed ? { ...nextState, nodes } : nextState;
 }
 
 function mergeNodeResults(state, nodeResults) {
@@ -259,6 +528,17 @@ function parseCIDRInput(value) {
     .filter(Boolean);
 }
 
+function normalizeText(value) {
+  return String(value ?? "").trim();
+}
+
+function normalizeTextList(values) {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+  return values.map((item) => normalizeText(item)).filter(Boolean);
+}
+
 function formatListenAddress(listener) {
   const host = String(listener?.host || "127.0.0.1").trim();
   const port = Number(listener?.port || 0);
@@ -273,6 +553,164 @@ function listenerDisplayName(listener, index) {
   const name = String(listener?.name || `socks${index + 1}`).trim();
   const address = formatListenAddress(listener);
   return address ? `${name} (${address})` : name;
+}
+
+function listenerBackendPolicyEnabled(listener) {
+  if (!listener) {
+    return false;
+  }
+  if (listener.backend_policy_enabled === true) {
+    return true;
+  }
+  if (listener.backend_policy_enabled === false) {
+    return false;
+  }
+  return Boolean(
+    normalizeText(listener.country_code) ||
+      normalizeText(listener.fixed_node_id) ||
+      normalizeTextList(listener.entry_cidrs).length,
+  );
+}
+
+function formatOverviewStatus(current) {
+  if (!current) {
+    return "加载中";
+  }
+  const status = normalizeText(current.status);
+  return status ? formatBackendStatus(status) : statusText(current);
+}
+
+function formatListenerOverviewSummary(current) {
+  if (!current) {
+    return "加载中";
+  }
+
+  const listeners = Array.isArray(current.socks5_listeners) ? current.socks5_listeners : [];
+  const backends = Array.isArray(current.listener_backends) ? current.listener_backends : [];
+  if (!listeners.length) {
+    return "未配置 SOCKS5 入口";
+  }
+
+  const enabledCount = listeners.filter((listener) => listener?.enabled !== false).length;
+  const runningCount = backends.filter((backend) => backend?.status === "running").length;
+  const errorCount = backends.filter((backend) => backend?.status === "error" || backend?.error).length;
+  const parts = [`共 ${listeners.length} 个入口`, `${enabledCount} 个启用`, `${runningCount} 个运行`];
+  if (errorCount) {
+    parts.push(`${errorCount} 个异常`);
+  }
+  return parts.join(" / ");
+}
+
+function findBackendForListener(listener, index, backendIndexes) {
+  const listenAddress = formatListenAddress(listener);
+  const listenerName = normalizeText(listener?.name || `socks${index + 1}`);
+  return (
+    (listenAddress ? backendIndexes.byListenAddress.get(listenAddress) : null) ||
+    (listenerName ? backendIndexes.byListenerName.get(listenerName) : null) ||
+    null
+  );
+}
+
+function formatListenerPolicy(listener, backend, entryCIDRs) {
+  const safeEntryCIDRs = Array.isArray(entryCIDRs) ? entryCIDRs : [];
+  const countryCode = normalizeText(backend?.country_code || listener?.country_code).toUpperCase();
+  const fixedNodeID = normalizeText(listener?.fixed_node_id);
+  const hasPolicy = listenerBackendPolicyEnabled(listener) || countryCode || fixedNodeID || safeEntryCIDRs.length;
+  if (!hasPolicy) {
+    return "自动选择";
+  }
+
+  const parts = [];
+  if (countryCode) {
+    parts.push(`国家 ${countryCode}`);
+  }
+  if (fixedNodeID) {
+    parts.push(`固定节点 ${fixedNodeID}`);
+  }
+  if (safeEntryCIDRs.length) {
+    parts.push(`入口网段 ${safeEntryCIDRs.join(", ")}`);
+  }
+  return parts.length ? parts.join(" / ") : "已开启";
+}
+
+function formatListenerOverviewMessage(backend, status, connected) {
+  const error = normalizeText(backend?.error);
+  if (error) {
+    return error;
+  }
+
+  const message = normalizeText(backend?.message);
+  if (message) {
+    return message;
+  }
+
+  switch (status) {
+    case "disabled":
+      return "入口已停用";
+    case "running":
+      return "入口后端运行正常";
+    case "switching":
+      return "入口后端正在切换";
+    case "starting":
+      return "入口后端正在启动";
+    case "stopped":
+      return connected ? "入口后端已停止" : "网关未连接";
+    default:
+      return connected ? "等待后端上报状态" : "网关未连接";
+  }
+}
+
+function buildListenerOverviewItem(listener, backend, index, connected) {
+  const listenerName = normalizeText(listener?.name || backend?.listener_name) || `socks${index + 1}`;
+  const listenAddress = normalizeText(backend?.listen_address) || formatListenAddress(listener);
+  const backendEntryCIDRs = normalizeTextList(backend?.entry_cidrs);
+  const listenerEntryCIDRs = normalizeTextList(listener?.entry_cidrs);
+  const entryCIDRs = backendEntryCIDRs.length ? backendEntryCIDRs : listenerEntryCIDRs;
+  const enabled = listener ? listener.enabled !== false : true;
+  const status = enabled ? normalizeText(backend?.status) || (connected ? "starting" : "stopped") : "disabled";
+
+  return {
+    key: `${listenAddress || listenerName}-${index}`,
+    title: listenerName,
+    listenAddress: listenAddress || "-",
+    proxyURL: normalizeText(backend?.proxy_url),
+    status,
+    message: formatListenerOverviewMessage(backend, status, connected),
+    hasError: Boolean(normalizeText(backend?.error)),
+    policy: formatListenerPolicy(listener, backend, entryCIDRs),
+    nodeID: normalizeText(backend?.node_id),
+    entryIP: normalizeText(backend?.entry_ip),
+    exitIP: normalizeText(backend?.exit_ip),
+  };
+}
+
+function listenerOverviewItems(current) {
+  const listeners = Array.isArray(current?.socks5_listeners) ? current.socks5_listeners : [];
+  const backends = Array.isArray(current?.listener_backends) ? current.listener_backends : [];
+  const connected = Boolean(current?.connected);
+  const backendIndexes = {
+    byListenAddress: new Map(),
+    byListenerName: new Map(),
+  };
+
+  for (const backend of backends) {
+    const listenAddress = normalizeText(backend?.listen_address);
+    const listenerName = normalizeText(backend?.listener_name);
+    if (listenAddress && !backendIndexes.byListenAddress.has(listenAddress)) {
+      backendIndexes.byListenAddress.set(listenAddress, backend);
+    }
+    if (listenerName && !backendIndexes.byListenerName.has(listenerName)) {
+      backendIndexes.byListenerName.set(listenerName, backend);
+    }
+  }
+
+  if (listeners.length) {
+    return listeners.map((listener, index) =>
+      buildListenerOverviewItem(listener, findBackendForListener(listener, index, backendIndexes), index, connected),
+    );
+  }
+
+  return backends.map((backend, index) => buildListenerOverviewItem(null, backend, index, connected));
 }
 
 function apiBaseFromConfig(config) {
@@ -294,6 +732,7 @@ function App() {
   const [form, setForm] = useState(emptyForm);
   const [listeners, setListeners] = useState([]);
   const [logs, setLogs] = useState([]);
+  const [auditLogs, setAuditLogs] = useState([]);
   const [gatewayComponents, setGatewayComponents] = useState([]);
   const [proxyTestResult, setProxyTestResult] = useState(null);
   const [formDirty, setFormDirty] = useState(false);
@@ -324,7 +763,7 @@ function App() {
   const loadState = useCallback(async (forceSync = false) => {
     try {
       const state = await api("state");
-      setCurrent(state);
+      setCurrent((previous) => mergeStateWithPreviousNodeResults(state, previous));
       if (forceSync || !formDirty) {
         setForm(stateToForm(state));
         setListeners((state.socks5_listeners || []).map(normalizeListener));
@@ -335,6 +774,17 @@ function App() {
       }
     }
   }, [formDirty, handleAuthError]);
+
+  const loadAuditLogs = useCallback(async () => {
+    try {
+      const data = await api("audit_logs");
+      setAuditLogs(data.audit_logs || []);
+    } catch (error) {
+      if (!handleAuthError(error)) {
+        throw error;
+      }
+    }
+  }, [handleAuthError]);
 
   const loadLogs = useCallback(async () => {
     try {
@@ -412,13 +862,14 @@ function App() {
     }
     loadState()
       .then(loadLogs)
+      .then(loadAuditLogs)
       .then(loadGatewayStatus)
       .catch((error) => {
         if (!handleAuthError(error)) {
           setActionMsg(error.message);
         }
       });
-  }, [auth.authenticated, handleAuthError, loadGatewayStatus, loadLogs, loadState]);
+  }, [auth.authenticated, handleAuthError, loadAuditLogs, loadGatewayStatus, loadLogs, loadState]);
 
   useEffect(() => {
     if (!auth.authenticated) {
@@ -427,10 +878,11 @@ function App() {
     const timer = window.setInterval(() => {
       loadState().catch(handleBackgroundRefreshError);
       loadLogs().catch(handleBackgroundRefreshError);
+      loadAuditLogs().catch(handleBackgroundRefreshError);
       loadGatewayStatus().catch(handleBackgroundRefreshError);
     }, 5000);
     return () => window.clearInterval(timer);
-  }, [auth.authenticated, handleBackgroundRefreshError, loadGatewayStatus, loadLogs, loadState]);
+  }, [auth.authenticated, handleBackgroundRefreshError, loadAuditLogs, loadGatewayStatus, loadLogs, loadState]);
 
   useEffect(() => {
     if (!auth.authenticated || (!isNodeTestAction(busyAction) && !batchTestActive)) {
@@ -482,6 +934,7 @@ function App() {
       setAuth({ checked: true, authenticated: false, username: "" });
       setCurrent(null);
       setLogs([]);
+      setAuditLogs([]);
       setGatewayComponents([]);
       setProxyTestResult(null);
       setBusyAction("");
@@ -823,8 +1276,10 @@ function App() {
         <RuntimePage
           gatewayComponents={gatewayComponents}
           logs={logs}
+          auditLogs={auditLogs}
           onRefreshGateway={() => loadGatewayStatus().catch((error) => setActionMsg(error.message))}
           onRefreshLogs={() => loadLogs().catch((error) => setActionMsg(error.message))}
+          onRefreshAuditLogs={() => loadAuditLogs().catch((error) => setActionMsg(error.message))}
         />
       ) : null}
     </main>
@@ -832,18 +1287,21 @@ function App() {
 }
 
 function OverviewPage({ current, runtimeWeb, restartHint, actionMsg, busyAction, proxyTestResult, onConnect, onDisconnect, onTestProxy, onRefresh }) {
+  const localProxyURLs = Array.isArray(current?.local_proxy_urls) ? current.local_proxy_urls : [];
   return (
     <section className="panel">
       <SectionTitle icon={Activity} title="连接概览" />
       <div className="field-grid">
-        <Readout label="状态" value={current?.message || current?.status || "-"} />
+        <Readout label="连接状态" value={formatOverviewStatus(current)} />
+        <Readout label="入口概况" value={formatListenerOverviewSummary(current)} />
         <Readout
           label="本地代理地址"
-          value={(current?.local_proxy_urls || []).length ? current.local_proxy_urls : ["-"]}
+          value={localProxyURLs.length ? localProxyURLs : ["-"]}
           mono
         />
         <Readout label="当前 Web 监听" value={runtimeWeb} mono />
         <Readout label="配置生效状态" value={restartHint} />
+        <Readout label="状态说明" value={current?.message || "-"} />
       </div>
       <ListenerBackendOverview current={current} />
       <ProxyTestDetails result={proxyTestResult} />
@@ -859,38 +1317,49 @@ function OverviewPage({ current, runtimeWeb, restartHint, actionMsg, busyAction,
 }
 
 function ListenerBackendOverview({ current }) {
-  const backends = current?.listener_backends || [];
-  if (!backends.length) {
+  const entries = listenerOverviewItems(current);
+  if (!entries.length) {
     return (
       <div className="overview-section">
         <label>SOCKS5 入口连接</label>
-        <div className="readout">暂无运行中的入口后端状态。</div>
+        <div className="readout">{current ? "暂无 SOCKS5 入口配置。" : "正在加载入口状态。"}</div>
       </div>
     );
   }
   return (
     <div className="overview-section">
-      <label>SOCKS5 入口连接</label>
+      <div className="overview-title-line">
+        <label>SOCKS5 入口连接</label>
+        <span className="muted">{entries.length} 个入口</span>
+      </div>
       <div className="backend-grid">
-        {backends.map((backend) => (
-          <div className="backend-card" key={backend.listen_address || backend.listener_name}>
+        {entries.map((entry) => (
+          <div className={`backend-card ${entry.hasError ? "is-error" : entry.status === "disabled" ? "is-disabled" : ""}`} key={entry.key}>
             <div className="backend-head">
-              <strong>{backend.listener_name || backend.listen_address || "-"}</strong>
-              <span className={`badge ${backend.status === "running" ? "ok" : backend.status === "error" ? "err" : ""}`}>{formatBackendStatus(backend.status)}</span>
+              <strong>{entry.title}</strong>
+              <span className={`badge ${backendStatusBadgeClass(entry.status)}`}>{formatBackendStatus(entry.status)}</span>
             </div>
-            <div className="detail-lines">
-              <span>监听 {backend.listen_address || "-"}</span>
-              {backend.node_id ? <span>节点 {backend.node_id}</span> : null}
-              {backend.entry_ip ? <span>入口 IP {backend.entry_ip}</span> : null}
-              {backend.exit_ip ? <span>出口 IP {backend.exit_ip}</span> : null}
-              {backend.country_code ? <span>国家 {backend.country_code}</span> : null}
-              {backend.entry_cidrs?.length ? <span>入口网段 {backend.entry_cidrs.join(", ")}</span> : null}
-              {backend.proxy_url ? <span className="mono">代理 {backend.proxy_url}</span> : null}
-              {backend.error ? <span className="error-text">{backend.error}</span> : <span>{backend.message || "-"}</span>}
+            <div className="backend-detail-grid">
+              <BackendDetailItem label="监听地址" value={entry.listenAddress} mono />
+              <BackendDetailItem label="代理地址" value={entry.proxyURL || "-"} mono />
+              <BackendDetailItem label="绑定策略" value={entry.policy} />
+              <BackendDetailItem label="当前节点" value={entry.nodeID || "-"} mono />
+              <BackendDetailItem label="入口 IP" value={entry.entryIP || "-"} mono />
+              <BackendDetailItem label="出口 IP" value={entry.exitIP || "-"} mono />
+              <BackendDetailItem label={entry.hasError ? "错误" : "说明"} value={entry.message} danger={entry.hasError} wide />
             </div>
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+function BackendDetailItem({ label, value, mono = false, danger = false, wide = false }) {
+  return (
+    <div className={`backend-detail ${wide ? "wide" : ""}`}>
+      <span className="backend-detail-label">{label}</span>
+      <span className={`backend-detail-value ${mono ? "mono" : ""} ${danger ? "danger" : ""}`}>{value || "-"}</span>
     </div>
   );
 }
@@ -953,6 +1422,7 @@ function NodesPage({
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(25);
   const [selectedIDs, setSelectedIDs] = useState([]);
+  const [nodeSort, setNodeSort] = useState(defaultNodeSort);
 
   const countries = useMemo(() => {
     const values = new Map();
@@ -988,6 +1458,7 @@ function NodesPage({
         formatEndpoint(node),
         formatProbeStatus(node),
         formatExitQualityText(node),
+        formatIPNetworkText(node.exit_ip_info),
       ]
         .filter(Boolean)
         .join(" ")
@@ -996,15 +1467,16 @@ function NodesPage({
     });
   }, [filters, nodes]);
 
-  const totalPages = Math.max(1, Math.ceil(filteredNodes.length / pageSize));
+  const sortedNodes = useMemo(() => sortNodes(filteredNodes, nodeSort), [filteredNodes, nodeSort]);
+  const totalPages = Math.max(1, Math.ceil(sortedNodes.length / pageSize));
   const safePage = Math.min(page, totalPages);
-  const pageNodes = filteredNodes.slice((safePage - 1) * pageSize, safePage * pageSize);
+  const pageNodes = sortedNodes.slice((safePage - 1) * pageSize, safePage * pageSize);
   const pageNodeIDs = pageNodes.map((node) => node.id).filter(Boolean);
   const selectedOnPage = pageNodeIDs.filter((id) => selectedIDs.includes(id));
 
   useEffect(() => {
     setPage(1);
-  }, [filters.keyword, filters.country, filters.ipType, pageSize]);
+  }, [filters.keyword, filters.country, filters.ipType, nodeSort.direction, nodeSort.key, pageSize]);
 
   useEffect(() => {
     setSelectedIDs((previous) => previous.filter((id) => nodes.some((node) => node.id === id)));
@@ -1034,6 +1506,18 @@ function NodesPage({
 
   const updateFilter = (field, value) => {
     setFilters((previous) => ({ ...previous, [field]: value }));
+  };
+
+  const updateNodeSort = (key) => {
+    const nextKey = normalizeNodeSortKey(key);
+    setNodeSort((previous) => {
+      const previousKey = normalizeNodeSortKey(previous?.key);
+      const previousDirection = normalizeNodeSortDirection(previous?.direction);
+      return {
+        key: nextKey,
+        direction: previousKey === nextKey && previousDirection === "asc" ? "desc" : "asc",
+      };
+    });
   };
 
   const toggleNode = (nodeID) => {
@@ -1111,6 +1595,7 @@ function NodesPage({
       </div>
       <NodeList
         nodes={pageNodes}
+        sort={nodeSort}
         selectedIDs={selectedIDs}
         busyAction={busyAction}
         batchTesting={batchActionActive}
@@ -1122,6 +1607,7 @@ function NodesPage({
         onCancelTest={onCancelTest}
         onConnect={onConnect}
         onDisconnect={onDisconnect}
+        onSort={updateNodeSort}
       />
       <Pagination
         page={safePage}
@@ -1195,7 +1681,7 @@ function SettingsPage({ form, saveMsg, busyAction, onUpdateForm, onSave }) {
   );
 }
 
-function RuntimePage({ gatewayComponents, logs, onRefreshGateway, onRefreshLogs }) {
+function RuntimePage({ gatewayComponents, logs, auditLogs, onRefreshGateway, onRefreshLogs, onRefreshAuditLogs }) {
   return (
     <div className="runtime-grid">
       <section className="panel">
@@ -1213,6 +1699,14 @@ function RuntimePage({ gatewayComponents, logs, onRefreshGateway, onRefreshLogs 
           action={<ActionButton icon={RefreshCw} label="刷新日志" compact onClick={onRefreshLogs} />}
         />
         <LogView logs={logs} />
+      </section>
+      <section className="panel">
+        <PanelHead
+          icon={ClipboardList}
+          title="审计日志"
+          action={<ActionButton icon={RefreshCw} label="刷新审计" compact onClick={onRefreshAuditLogs} />}
+        />
+        <AuditLogView logs={auditLogs} />
       </section>
     </div>
   );
@@ -1287,6 +1781,75 @@ function TextInput({ label, value, onChange, type = "text", ...props }) {
   );
 }
 
+function PasswordInput({ label, value, onChange, disabled = false, ...props }) {
+  const [visible, setVisible] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const password = String(value ?? "");
+  const VisibilityIcon = visible ? EyeOff : Eye;
+  const CopyIcon = copied ? CopyCheck : Copy;
+
+  useEffect(() => {
+    setCopied(false);
+  }, [password]);
+
+  useEffect(() => {
+    if (!copied || typeof window === "undefined") {
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setCopied(false), 1400);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  const copyPassword = async () => {
+    try {
+      await copyTextToClipboard(password);
+      setCopied(true);
+    } catch (error) {
+      const message = error?.message || "复制 SOCKS5 密码失败。";
+      console.error(message, error);
+      if (typeof window !== "undefined" && typeof window.alert === "function") {
+        window.alert(message);
+      }
+    }
+  };
+
+  return (
+    <div>
+      <label>{label}</label>
+      <div className="input-action-row">
+        <input
+          type={visible ? "text" : "password"}
+          value={password}
+          disabled={disabled}
+          onChange={(event) => onChange(event.target.value)}
+          {...props}
+        />
+        <button
+          type="button"
+          className="input-icon-button"
+          aria-label={visible ? "隐藏 SOCKS5 密码" : "显示 SOCKS5 密码"}
+          aria-pressed={visible}
+          disabled={disabled}
+          title={visible ? "隐藏密码" : "显示密码"}
+          onClick={() => setVisible((previous) => !previous)}
+        >
+          <VisibilityIcon size={16} aria-hidden="true" />
+        </button>
+        <button
+          type="button"
+          className="input-icon-button"
+          aria-label={copied ? "已复制 SOCKS5 密码" : "复制 SOCKS5 密码"}
+          disabled={disabled || !password}
+          title={copied ? "已复制" : "复制密码"}
+          onClick={copyPassword}
+        >
+          <CopyIcon size={16} aria-hidden="true" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function SelectInput({ label, value, onChange, options }) {
   return (
     <div>
@@ -1344,6 +1907,20 @@ function formatIPTypeLabel(type) {
   return ipTypeOptions.find(([value]) => value === type)?.[1] || "未知";
 }
 
+function backendStatusBadgeClass(status) {
+  switch (status) {
+    case "running":
+      return "ok";
+    case "error":
+      return "err";
+    case "switching":
+    case "starting":
+      return "warn";
+    default:
+      return "";
+  }
+}
+
 function formatBackendStatus(status) {
   switch (status) {
     case "running":
@@ -1356,6 +1933,8 @@ function formatBackendStatus(status) {
       return "异常";
     case "stopped":
       return "已停止";
+    case "disabled":
+      return "已停用";
     default:
       return status || "-";
   }
@@ -1517,13 +2096,31 @@ function formatExitQualityText(node) {
   return [
     formatIPTypeLabel(info.ip_type),
     info.ip,
-    info.asn,
-    info.as_organization || info.organization,
     location,
     Number.isFinite(Number(info.fraud_score)) ? `Fraud ${info.fraud_score}` : "",
   ]
     .filter(Boolean)
     .join(" / ");
+}
+
+function formatIPASN(info) {
+  const asn = String(info?.asn || "").trim();
+  if (asn) {
+    return asn;
+  }
+  const asnNumber = Number(info?.asn_number);
+  if (!Number.isInteger(asnNumber) || asnNumber <= 0) {
+    return "";
+  }
+  return `AS${asnNumber}`;
+}
+
+function formatIPNetworkText(info) {
+  if (!info) {
+    return "";
+  }
+  const provider = String(info.as_organization || info.organization || info.isp || "").trim();
+  return [formatIPASN(info), provider].filter(Boolean).join(" / ");
 }
 
 function NodeList({
@@ -1539,6 +2136,8 @@ function NodeList({
   onCancelTest,
   onConnect,
   onDisconnect,
+  onSort,
+  sort,
 }) {
   const defaultListenerKey = listenerOptions[0]?.key || "";
   const [selectedListeners, setSelectedListeners] = useState({});
@@ -1569,12 +2168,11 @@ function NodeList({
   }
   return (
     <div className="list-scroll">
-      <div className="node-row node-head" aria-hidden="true">
-        <span></span>
-        <span>国家</span>
-        <span>节点地址</span>
-        <span>状态</span>
-        <span>真实出口测试</span>
+      <div className="node-row node-head">
+        <span aria-hidden="true"></span>
+        {nodeSortColumns.map((column) => (
+          <SortableNodeHeader key={column.key} column={column} sort={sort} onSort={onSort} />
+        ))}
         <span>绑定入口</span>
         <span>操作</span>
       </div>
@@ -1623,6 +2221,7 @@ function NodeList({
             <div className="node-cell mono">{formatEndpoint(node)}</div>
             <div className="node-cell muted">{formatProbeStatus(node)}</div>
             <ExitTestInfo node={node} />
+            <NodeNetworkInfo node={node} />
             <select
               className="node-listener-select"
               value={selectedListener}
@@ -1649,6 +2248,34 @@ function NodeList({
         );
       })}
     </div>
+  );
+}
+
+function SortableNodeHeader({ column, sort, onSort }) {
+  const sortKey = normalizeNodeSortKey(sort?.key);
+  const direction = normalizeNodeSortDirection(sort?.direction);
+  const active = sortKey === column.key;
+  const nextDirection = active && direction === "asc" ? "desc" : "asc";
+  const currentText = active ? `当前${nodeSortDirectionLabels[direction]}` : "当前未排序";
+  const sortable = typeof onSort === "function";
+
+  return (
+    <button
+      type="button"
+      className={`node-sort-button ${active ? "active" : ""}`}
+      aria-label={`${column.label}，${currentText}，点击${nodeSortDirectionLabels[nextDirection]}排序`}
+      aria-pressed={active}
+      disabled={!sortable}
+      title={`按${column.label}${nodeSortDirectionLabels[nextDirection]}排序`}
+      onClick={() => {
+        if (sortable) {
+          onSort(column.key);
+        }
+      }}
+    >
+      <span>{column.label}</span>
+      <ArrowUpDown className={`sort-icon ${active ? direction : ""}`} size={14} aria-hidden="true" />
+    </button>
   );
 }
 
@@ -1694,6 +2321,15 @@ function ExitTestInfo({ node }) {
   return (
     <div className="node-exit-test" title={quality}>
       <span className="node-quality">{quality}</span>
+    </div>
+  );
+}
+
+function NodeNetworkInfo({ node }) {
+  const network = formatIPNetworkText(node?.exit_ip_info);
+  return (
+    <div className="node-cell node-network" title={network || "无 ASN / 运营商信息"}>
+      {network || "-"}
     </div>
   );
 }
@@ -1748,11 +2384,27 @@ function ListenerEditor({ listeners, onUpdate, onRemove }) {
     <div className="listener-list">
       {listeners.map((listener, index) => {
         const backendPolicyEnabled = listener.backend_policy_enabled === true;
+        const generateListenerCredentials = () => {
+          try {
+            const credentials = generateSocksCredentials();
+            onUpdate(index, "username", credentials.username);
+            onUpdate(index, "password", credentials.password);
+          } catch (error) {
+            const message = error?.message || "生成 SOCKS5 随机用户名和密码失败。";
+            console.error(message, error);
+            if (typeof window !== "undefined" && typeof window.alert === "function") {
+              window.alert(message);
+            }
+          }
+        };
         return (
           <div className="listener" key={`${listener.name}-${index}`}>
             <div className="listener-head">
               <strong>{listener.name || `socks${index + 1}`}</strong>
-              <ActionButton icon={Trash2} label="删除" danger compact onClick={() => onRemove(index)} />
+              <div className="listener-head-actions">
+                <ActionButton icon={Dices} label="随机账号密码" compact onClick={generateListenerCredentials} />
+                <ActionButton icon={Trash2} label="删除" danger compact onClick={() => onRemove(index)} />
+              </div>
             </div>
             <div className="form-grid">
               <TextInput label="名称" value={listener.name} onChange={(value) => onUpdate(index, "name", value)} />
@@ -1768,7 +2420,7 @@ function ListenerEditor({ listeners, onUpdate, onRemove }) {
               <TextInput label="监听地址" value={listener.host} onChange={(value) => onUpdate(index, "host", value)} />
               <TextInput label="监听端口" type="number" min="1024" max="65535" value={listener.port} onChange={(value) => onUpdate(index, "port", value)} />
               <TextInput label="SOCKS5 用户名" value={listener.username} onChange={(value) => onUpdate(index, "username", value)} autoComplete="off" placeholder="留空则无鉴权" />
-              <TextInput label="SOCKS5 密码" type="password" value={listener.password} onChange={(value) => onUpdate(index, "password", value)} autoComplete="new-password" placeholder="公网监听必须填写" />
+              <PasswordInput label="SOCKS5 密码" value={listener.password} onChange={(value) => onUpdate(index, "password", value)} autoComplete="new-password" placeholder="公网监听必须填写" />
               <SelectInput
                 label="绑定策略"
                 value={String(backendPolicyEnabled)}
@@ -1789,12 +2441,12 @@ function ListenerEditor({ listeners, onUpdate, onRemove }) {
   );
 }
 
-function LogView({ logs }) {
+function LogList({ logs, className, lineClassName, timeClassName, levelClassName, emptyText }) {
   if (!logs.length) {
-    return <div className="logs">暂无日志。</div>;
+    return <div className={className}>{emptyText}</div>;
   }
   return (
-    <div className="logs">
+    <div className={className}>
       {logs.map((item, index) => {
         const fields = item.fields
           ? Object.entries(item.fields)
@@ -1803,14 +2455,40 @@ function LogView({ logs }) {
           : "";
         const level = item.level || "INFO";
         return (
-          <div className="log-line" key={`${item.time}-${index}`}>
-            <span className="log-time">{item.time || ""}</span>{" "}
-            <span className={`log-level ${level}`}>{level}</span> {item.message || ""}
+          <div className={lineClassName} key={`${item.time}-${index}`}>
+            <span className={timeClassName}>{item.time || ""}</span>{" "}
+            <span className={`${levelClassName} ${level}`}>{level}</span> {item.message || ""}
             {fields}
           </div>
         );
       })}
     </div>
+  );
+}
+
+function LogView({ logs }) {
+  return (
+    <LogList
+      logs={logs}
+      className="logs"
+      lineClassName="log-line"
+      timeClassName="log-time"
+      levelClassName="log-level"
+      emptyText="暂无日志。"
+    />
+  );
+}
+
+function AuditLogView({ logs }) {
+  return (
+    <LogList
+      logs={logs}
+      className="audit-logs"
+      lineClassName="audit-log-line"
+      timeClassName="audit-log-time"
+      levelClassName="audit-log-level"
+      emptyText="暂无审计日志。"
+    />
   );
 }
 

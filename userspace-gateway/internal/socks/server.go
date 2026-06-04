@@ -113,14 +113,14 @@ func (s *Server) handleClient(ctx context.Context, client net.Conn) {
 
 	target, err := s.handshake(client)
 	if err != nil {
-		s.logger.Warn("SOCKS5 入口连接审计", "client_ip", clientIP, "result", "handshake_failed", "error", err)
+		s.logger.Warn("SOCKS5 入口连接审计", "audit", true, "category", "socks5", "client_ip", clientIP, "result", "handshake_failed", "error", err)
 		s.logger.Warn("SOCKS5 握手失败", "client", client.RemoteAddr().String(), "error", err)
 		return
 	}
 
 	upstream, err := s.dialer.DialContext(ctx, target.Host, target.Port, s.connectTimeout)
 	if err != nil {
-		s.logger.Warn("SOCKS5 入口连接审计", "client_ip", clientIP, "target", target.String(), "result", "dial_failed", "error", err)
+		s.logger.Warn("SOCKS5 入口连接审计", "audit", true, "category", "socks5", "client_ip", clientIP, "target", target.String(), "result", "dial_failed", "error", err)
 		s.logger.Warn("SOCKS5 目标连接失败", "target", target.String(), "error", err)
 		_ = sendReply(client, 0x04)
 		return
@@ -128,11 +128,11 @@ func (s *Server) handleClient(ctx context.Context, client net.Conn) {
 	defer upstream.Close()
 
 	if err := sendReply(client, 0x00); err != nil {
-		s.logger.Warn("SOCKS5 入口连接审计", "client_ip", clientIP, "target", target.String(), "result", "reply_failed", "error", err)
+		s.logger.Warn("SOCKS5 入口连接审计", "audit", true, "category", "socks5", "client_ip", clientIP, "target", target.String(), "result", "reply_failed", "error", err)
 		s.logger.Warn("SOCKS5 响应失败", "target", target.String(), "error", err)
 		return
 	}
-	s.logger.Info("SOCKS5 入口连接审计", "client_ip", clientIP, "target", target.String(), "result", "connected")
+	s.logger.Info("SOCKS5 入口连接审计", "audit", true, "category", "socks5", "client_ip", clientIP, "target", target.String(), "result", "connected")
 	_ = client.SetDeadline(time.Time{})
 	relay(client, upstream)
 }

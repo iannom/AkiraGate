@@ -441,6 +441,11 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.logs(w)
+	case r.Method == http.MethodGet && path == "/api/audit_logs":
+		if !s.requireAuth(w, r) {
+			return
+		}
+		s.auditLogs(w)
 	case r.Method == http.MethodGet && path == "/api/gateway_status":
 		if !s.requireAuth(w, r) {
 			return
@@ -983,6 +988,14 @@ func (s *Server) logs(w http.ResponseWriter) {
 	s.sendJSON(w, map[string]any{"logs": s.logBuffer.Entries()})
 }
 
+func (s *Server) auditLogs(w http.ResponseWriter) {
+	if s.logBuffer == nil {
+		s.sendJSON(w, map[string]any{"audit_logs": []LogEntry{}})
+		return
+	}
+	s.sendJSON(w, map[string]any{"audit_logs": s.logBuffer.AuditEntries()})
+}
+
 func (s *Server) sendIndex(w http.ResponseWriter, r *http.Request) {
 	webRoot := s.webRootSnapshot()
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1459,14 +1472,64 @@ func (s *Server) refreshNodes(w http.ResponseWriter) {
 	}
 	s.mu.Lock()
 	activeIDs := s.activeNodeIDsLocked()
+	preserveNodeProbeResults(nodes, s.nodes, nil)
 	for idx := range nodes {
 		_, active := activeIDs[nodes[idx].ID]
 		nodes[idx].Active = active
 	}
 	s.nodes = nodes
-	s.failed = map[string]string{}
+	s.failed = failedNodesFromProbeResults(nodes)
 	s.mu.Unlock()
 	s.sendJSON(w, map[string]any{"ok": true, "nodes": nodes})
+}
+
+func preserveNodeProbeResults(nodes []vpngate.Node, previousNodes []vpngate.Node, previousFailed map[string]string) {
+	if len(nodes) == 0 {
+		return
+	}
+	previousByID := make(map[string]vpngate.Node, len(previousNodes))
+	for _, node := range previousNodes {
+		if node.ID != "" && hasNodeProbeResult(node) {
+			previousByID[node.ID] = node
+		}
+	}
+	if len(previousByID) == 0 {
+		previousByID = nil
+	}
+	for idx := range nodes {
+		if hasNodeProbeResult(nodes[idx]) {
+			continue
+		}
+		if message, failed := previousFailed[nodes[idx].ID]; failed {
+			nodes[idx].ProbeStatus = "unavailable"
+			nodes[idx].ProbeMessage = message
+			nodes[idx].ProbeLatency = 0
+			nodes[idx].ExitIPInfo = nil
+			continue
+		}
+		if previous, ok := previousByID[nodes[idx].ID]; ok {
+			nodes[idx].ProbeStatus = previous.ProbeStatus
+			nodes[idx].ProbeMessage = previous.ProbeMessage
+			nodes[idx].ProbeLatency = previous.ProbeLatency
+			nodes[idx].ExitIPInfo = previous.ExitIPInfo
+			continue
+		}
+	}
+}
+
+func hasNodeProbeResult(node vpngate.Node) bool {
+	status := strings.TrimSpace(node.ProbeStatus)
+	return status != "" && status != "not_checked"
+}
+
+func failedNodesFromProbeResults(nodes []vpngate.Node) map[string]string {
+	failed := map[string]string{}
+	for _, node := range nodes {
+		if node.ID != "" && node.ProbeStatus == "unavailable" {
+			failed[node.ID] = node.ProbeMessage
+		}
+	}
+	return failed
 }
 
 func bindNodeToListener(config Config, nodeID string, listenerName string, listenAddress string) (Config, gatewayconfig.Listener, error) {
@@ -2620,11 +2683,13 @@ func (s *Server) refreshNodesInBackground() {
 	}
 	s.mu.Lock()
 	activeIDs := s.activeNodeIDsLocked()
+	preserveNodeProbeResults(nodes, s.nodes, s.failed)
 	for idx := range nodes {
 		_, active := activeIDs[nodes[idx].ID]
 		nodes[idx].Active = active
 	}
 	s.nodes = s.mergeRetainedNodesLocked(nodes, time.Now())
+	s.failed = failedNodesFromProbeResults(s.nodes)
 	s.mu.Unlock()
 	s.logger.Info("VPNGate 节点已刷新", "count", len(nodes))
 }
@@ -3250,6 +3315,11 @@ func fetchIPPureInfo(ctx context.Context, client *http.Client, infoURL string) (
 		FetchedAt:      time.Now().Format(time.RFC3339),
 	}
 	info.IPType = classifyIPType(info)
+	if info.IPType == "unknown" {
+		// IPPure 测试版响应可能缺少明确类型字段；业务上将未识别类型按机房 IP 处理。
+		info.Hosting = true
+		info.IPType = "datacenter"
+	}
 	return info, nil
 }
 
