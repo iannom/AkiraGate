@@ -4,6 +4,7 @@ import {
   Activity,
   CircleX,
   CheckSquare,
+  ClipboardList,
   LogOut,
   CirclePlus,
   ChevronsLeft,
@@ -146,6 +147,48 @@ function formatFlagFallbackText(code) {
 function isNodeTestAction(actionName) {
   const name = String(actionName || "");
   return name === "test-nodes" || (name.startsWith("test-") && name !== "test-proxy");
+}
+
+function hasNodeProbeResult(node) {
+  const status = String(node?.probe_status || "").trim();
+  return status !== "" && status !== "not_checked";
+}
+
+function mergeStateWithPreviousNodeResults(nextState, previousState) {
+  if (!nextState || !Array.isArray(nextState.nodes) || !Array.isArray(previousState?.nodes)) {
+    return nextState;
+  }
+
+  const previousNodes = new Map();
+  for (const node of previousState.nodes) {
+    if (node?.id && hasNodeProbeResult(node)) {
+      previousNodes.set(node.id, node);
+    }
+  }
+  if (!previousNodes.size) {
+    return nextState;
+  }
+
+  let changed = false;
+  const nodes = nextState.nodes.map((node) => {
+    if (!node?.id || hasNodeProbeResult(node)) {
+      return node;
+    }
+    const previous = previousNodes.get(node.id);
+    if (!previous) {
+      return node;
+    }
+    changed = true;
+    return {
+      ...node,
+      probe_status: previous.probe_status,
+      probe_message: previous.probe_message,
+      probe_latency_ms: previous.probe_latency_ms,
+      exit_ip_info: previous.exit_ip_info,
+    };
+  });
+
+  return changed ? { ...nextState, nodes } : nextState;
 }
 
 function mergeNodeResults(state, nodeResults) {
@@ -463,6 +506,7 @@ function App() {
   const [form, setForm] = useState(emptyForm);
   const [listeners, setListeners] = useState([]);
   const [logs, setLogs] = useState([]);
+  const [auditLogs, setAuditLogs] = useState([]);
   const [gatewayComponents, setGatewayComponents] = useState([]);
   const [proxyTestResult, setProxyTestResult] = useState(null);
   const [formDirty, setFormDirty] = useState(false);
@@ -493,7 +537,7 @@ function App() {
   const loadState = useCallback(async (forceSync = false) => {
     try {
       const state = await api("state");
-      setCurrent(state);
+      setCurrent((previous) => mergeStateWithPreviousNodeResults(state, previous));
       if (forceSync || !formDirty) {
         setForm(stateToForm(state));
         setListeners((state.socks5_listeners || []).map(normalizeListener));
@@ -504,6 +548,17 @@ function App() {
       }
     }
   }, [formDirty, handleAuthError]);
+
+  const loadAuditLogs = useCallback(async () => {
+    try {
+      const data = await api("audit_logs");
+      setAuditLogs(data.audit_logs || []);
+    } catch (error) {
+      if (!handleAuthError(error)) {
+        throw error;
+      }
+    }
+  }, [handleAuthError]);
 
   const loadLogs = useCallback(async () => {
     try {
@@ -581,13 +636,14 @@ function App() {
     }
     loadState()
       .then(loadLogs)
+      .then(loadAuditLogs)
       .then(loadGatewayStatus)
       .catch((error) => {
         if (!handleAuthError(error)) {
           setActionMsg(error.message);
         }
       });
-  }, [auth.authenticated, handleAuthError, loadGatewayStatus, loadLogs, loadState]);
+  }, [auth.authenticated, handleAuthError, loadAuditLogs, loadGatewayStatus, loadLogs, loadState]);
 
   useEffect(() => {
     if (!auth.authenticated) {
@@ -596,10 +652,11 @@ function App() {
     const timer = window.setInterval(() => {
       loadState().catch(handleBackgroundRefreshError);
       loadLogs().catch(handleBackgroundRefreshError);
+      loadAuditLogs().catch(handleBackgroundRefreshError);
       loadGatewayStatus().catch(handleBackgroundRefreshError);
     }, 5000);
     return () => window.clearInterval(timer);
-  }, [auth.authenticated, handleBackgroundRefreshError, loadGatewayStatus, loadLogs, loadState]);
+  }, [auth.authenticated, handleBackgroundRefreshError, loadAuditLogs, loadGatewayStatus, loadLogs, loadState]);
 
   useEffect(() => {
     if (!auth.authenticated || (!isNodeTestAction(busyAction) && !batchTestActive)) {
@@ -651,6 +708,7 @@ function App() {
       setAuth({ checked: true, authenticated: false, username: "" });
       setCurrent(null);
       setLogs([]);
+      setAuditLogs([]);
       setGatewayComponents([]);
       setProxyTestResult(null);
       setBusyAction("");
@@ -992,8 +1050,10 @@ function App() {
         <RuntimePage
           gatewayComponents={gatewayComponents}
           logs={logs}
+          auditLogs={auditLogs}
           onRefreshGateway={() => loadGatewayStatus().catch((error) => setActionMsg(error.message))}
           onRefreshLogs={() => loadLogs().catch((error) => setActionMsg(error.message))}
+          onRefreshAuditLogs={() => loadAuditLogs().catch((error) => setActionMsg(error.message))}
         />
       ) : null}
     </main>
@@ -1378,7 +1438,7 @@ function SettingsPage({ form, saveMsg, busyAction, onUpdateForm, onSave }) {
   );
 }
 
-function RuntimePage({ gatewayComponents, logs, onRefreshGateway, onRefreshLogs }) {
+function RuntimePage({ gatewayComponents, logs, auditLogs, onRefreshGateway, onRefreshLogs, onRefreshAuditLogs }) {
   return (
     <div className="runtime-grid">
       <section className="panel">
@@ -1396,6 +1456,14 @@ function RuntimePage({ gatewayComponents, logs, onRefreshGateway, onRefreshLogs 
           action={<ActionButton icon={RefreshCw} label="刷新日志" compact onClick={onRefreshLogs} />}
         />
         <LogView logs={logs} />
+      </section>
+      <section className="panel">
+        <PanelHead
+          icon={ClipboardList}
+          title="审计日志"
+          action={<ActionButton icon={RefreshCw} label="刷新审计" compact onClick={onRefreshAuditLogs} />}
+        />
+        <AuditLogView logs={auditLogs} />
       </section>
     </div>
   );
@@ -1988,12 +2056,12 @@ function ListenerEditor({ listeners, onUpdate, onRemove }) {
   );
 }
 
-function LogView({ logs }) {
+function LogList({ logs, className, lineClassName, timeClassName, levelClassName, emptyText }) {
   if (!logs.length) {
-    return <div className="logs">暂无日志。</div>;
+    return <div className={className}>{emptyText}</div>;
   }
   return (
-    <div className="logs">
+    <div className={className}>
       {logs.map((item, index) => {
         const fields = item.fields
           ? Object.entries(item.fields)
@@ -2002,14 +2070,40 @@ function LogView({ logs }) {
           : "";
         const level = item.level || "INFO";
         return (
-          <div className="log-line" key={`${item.time}-${index}`}>
-            <span className="log-time">{item.time || ""}</span>{" "}
-            <span className={`log-level ${level}`}>{level}</span> {item.message || ""}
+          <div className={lineClassName} key={`${item.time}-${index}`}>
+            <span className={timeClassName}>{item.time || ""}</span>{" "}
+            <span className={`${levelClassName} ${level}`}>{level}</span> {item.message || ""}
             {fields}
           </div>
         );
       })}
     </div>
+  );
+}
+
+function LogView({ logs }) {
+  return (
+    <LogList
+      logs={logs}
+      className="logs"
+      lineClassName="log-line"
+      timeClassName="log-time"
+      levelClassName="log-level"
+      emptyText="暂无日志。"
+    />
+  );
+}
+
+function AuditLogView({ logs }) {
+  return (
+    <LogList
+      logs={logs}
+      className="audit-logs"
+      lineClassName="audit-log-line"
+      timeClassName="audit-log-time"
+      levelClassName="audit-log-level"
+      emptyText="暂无审计日志。"
+    />
   );
 }
 

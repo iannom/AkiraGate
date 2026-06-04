@@ -426,7 +426,7 @@ h2 {
 
 .runtime-grid {
   display: grid;
-  grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.1fr);
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
   gap: 16px;
 }
 
@@ -450,7 +450,8 @@ h2 {
 }
 
 .mono,
-.logs {
+.logs,
+.audit-logs {
   font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
 }
 
@@ -674,7 +675,8 @@ h2 {
   margin-bottom: 10px;
 }
 
-.logs {
+.logs,
+.audit-logs {
   height: 260px;
   overflow: auto;
   white-space: pre-wrap;
@@ -685,24 +687,29 @@ h2 {
   padding: 10px;
 }
 
-.log-line {
+.log-line,
+.audit-log-line {
   margin: 0 0 6px;
 }
 
-.log-time {
+.log-time,
+.audit-log-time {
   color: var(--muted);
 }
 
-.log-level {
+.log-level,
+.audit-log-level {
   color: var(--ok);
   font-weight: 750;
 }
 
-.log-level.ERROR {
+.log-level.ERROR,
+.audit-log-level.ERROR {
   color: #fecdd3;
 }
 
-.log-level.WARN {
+.log-level.WARN,
+.audit-log-level.WARN {
   color: var(--warn);
 }
 

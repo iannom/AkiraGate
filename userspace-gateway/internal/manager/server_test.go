@@ -192,6 +192,41 @@ func TestLogsAPIRequiresAuthAndReturnsBufferedEntries(t *testing.T) {
 	}
 }
 
+func TestAuditLogsAPIRequiresAuthAndReturnsAuditEntries(t *testing.T) {
+	buffer := NewLogBuffer(10)
+	logger := slog.New(buffer.Handler())
+	config := testConfig()
+	server := NewServer(filepath.Join(t.TempDir(), "config.json"), config, logger, buffer)
+	logger.Info("普通运行日志", "component", "manager")
+	logger.Warn("SOCKS5 入口连接审计", "client_ip", "127.0.0.1", "result", "connected")
+	logger.Info("结构化审计事件", "audit", true, "actor", "admin")
+
+	req := httptest.NewRequest(http.MethodGet, "/secret/api/audit_logs", nil)
+	addLoginCookie(t, server, req)
+	rec := httptest.NewRecorder()
+
+	server.route(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("审计日志接口请求失败: %d", rec.Code)
+	}
+	var payload struct {
+		AuditLogs []LogEntry `json:"audit_logs"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("审计日志响应不是有效 JSON: %v", err)
+	}
+	if len(payload.AuditLogs) != 1 {
+		t.Fatalf("审计日志数量不符合预期: %d", len(payload.AuditLogs))
+	}
+	if payload.AuditLogs[0].Message != "结构化审计事件" {
+		t.Fatalf("审计日志内容不符合预期: %+v", payload.AuditLogs[0])
+	}
+	if payload.AuditLogs[0].Fields["audit"] != "true" || payload.AuditLogs[0].Fields["actor"] != "admin" {
+		t.Fatalf("结构化审计日志字段不符合预期: %+v", payload.AuditLogs[0])
+	}
+}
+
 func TestGatewayStatusAPI(t *testing.T) {
 	server := testServer(t)
 	server.listenHost = "127.0.0.1"
@@ -1082,6 +1117,82 @@ func TestMarkNodeProbeTestingUpdatesState(t *testing.T) {
 	}
 	if _, failed := state.FailedNodes["node-a"]; failed {
 		t.Fatal("重新测试中的节点不应继续留在失败列表")
+	}
+}
+
+func TestPreserveNodeProbeResultsKeepsResultsAfterNodeRefresh(t *testing.T) {
+	previous := []vpngate.Node{
+		{
+			ID:           "node-a",
+			ProbeStatus:  "available",
+			ProbeMessage: "节点真实出口可用",
+			ProbeLatency: 1234,
+			ExitIPInfo:   &vpngate.IPInfo{IP: "198.51.100.10", IPType: "residential"},
+		},
+		{
+			ID:           "node-b",
+			ProbeStatus:  "unavailable",
+			ProbeMessage: "OpenVPN 握手超时",
+		},
+		{
+			ID:           "node-c",
+			ProbeStatus:  "not_checked",
+			ProbeMessage: "旧的未测试提示不应保留",
+		},
+		{
+			ID:           "node-f",
+			ProbeStatus:  "available",
+			ProbeMessage: "备用节点真实出口可用",
+			ProbeLatency: 456,
+			ExitIPInfo:   &vpngate.IPInfo{IP: "198.51.100.20", IPType: "hosting"},
+		},
+	}
+	nodes := []vpngate.Node{
+		{ID: "node-a", ProbeStatus: "not_checked"},
+		{ID: "node-b"},
+		{ID: "node-c", ProbeStatus: "not_checked"},
+		{ID: "node-d", ProbeStatus: "testing", ProbeMessage: "正在测试节点真实出口"},
+		{ID: "node-e"},
+		{ID: "node-f"},
+		{ID: "node-g"},
+	}
+	previousFailed := map[string]string{
+		"node-a": "会话启动失败",
+		"node-e": "会话启动失败",
+	}
+
+	preserveNodeProbeResults(nodes, previous, previousFailed)
+	failed := failedNodesFromProbeResults(nodes)
+
+	if nodes[0].ProbeStatus != "unavailable" || nodes[0].ProbeMessage != "会话启动失败" {
+		t.Fatalf("后台刷新后会话失败应优先于旧可用真测结果: %+v", nodes[0])
+	}
+	if nodes[1].ProbeStatus != "unavailable" || nodes[1].ProbeMessage != "OpenVPN 握手超时" {
+		t.Fatalf("刷新后应保留不可用节点真测结果: %+v", nodes[1])
+	}
+	if nodes[2].ProbeStatus != "not_checked" || nodes[2].ProbeMessage != "" {
+		t.Fatalf("未测试状态不应保留旧提示: %+v", nodes[2])
+	}
+	if nodes[3].ProbeStatus != "testing" || nodes[3].ProbeMessage == "" {
+		t.Fatalf("刷新得到的有效测试状态不应被旧结果覆盖: %+v", nodes[3])
+	}
+	if nodes[4].ProbeStatus != "unavailable" || nodes[4].ProbeMessage != "会话启动失败" {
+		t.Fatalf("刷新后应保留失败列表中的会话失败: %+v", nodes[4])
+	}
+	if nodes[5].ProbeStatus != "available" || nodes[5].ProbeLatency != 456 || nodes[5].ExitIPInfo == nil {
+		t.Fatalf("刷新后应保留没有会话失败覆盖的可用节点真测结果: %+v", nodes[5])
+	}
+	if nodes[6].ProbeStatus != "" || nodes[6].ProbeMessage != "" {
+		t.Fatalf("没有真测和失败记录的新节点不应被标记: %+v", nodes[6])
+	}
+	if failed["node-a"] != "会话启动失败" {
+		t.Fatalf("失败节点表应保留会话失败并避免后台刷新后重复选择: %+v", failed)
+	}
+	if failed["node-b"] != "OpenVPN 握手超时" {
+		t.Fatalf("失败节点表应从保留后的真测结果重建: %+v", failed)
+	}
+	if failed["node-e"] != "会话启动失败" {
+		t.Fatalf("失败节点表应包含失败列表中保留的会话失败: %+v", failed)
 	}
 }
 

@@ -41,6 +41,18 @@ func (b *LogBuffer) Entries() []LogEntry {
 	return entries
 }
 
+func (b *LogBuffer) AuditEntries() []LogEntry {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	entries := make([]LogEntry, 0, len(b.entries))
+	for _, entry := range b.entries {
+		if isAuditLogEntry(entry) {
+			entries = append(entries, entry)
+		}
+	}
+	return entries
+}
+
 func (b *LogBuffer) append(entry LogEntry) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -174,4 +186,13 @@ func collectLogAttr(fields map[string]string, groups []string, attr slog.Attr) {
 	}
 	keyParts := append(append([]string{}, groups...), attr.Key)
 	fields[strings.Join(keyParts, ".")] = value.String()
+}
+
+func isAuditLogEntry(entry LogEntry) bool {
+	for key, value := range entry.Fields {
+		if strings.EqualFold(key, "audit") && strings.EqualFold(value, "true") {
+			return true
+		}
+	}
+	return false
 }
