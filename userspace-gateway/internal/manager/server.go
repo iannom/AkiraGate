@@ -18,6 +18,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -38,6 +39,8 @@ const (
 	exitInfoRequestLimit = 16 * 1024
 	probeStatusTesting   = "testing"
 	healthCheckInterval  = 60 * time.Second
+	proxyReuseWindow     = 60 * time.Minute
+	proxyJanitorInterval = 60 * time.Second
 )
 
 type nodeTestJob struct {
@@ -55,6 +58,29 @@ type nodeTestResult struct {
 type nodeProbeFunc func(context.Context, string) (vpngate.Node, error)
 
 type nodeTestToken struct{}
+
+type dynamicProxyStarter func(context.Context, dynamicProxyStartOptions) (dynamicProxyHandle, error)
+
+type dynamicProxyStartOptions struct {
+	Listener         gatewayconfig.Listener
+	ConfigPath       string
+	AuthFilePath     string
+	ConnectTimeout   time.Duration
+	HandshakeTimeout time.Duration
+	NodeID           string
+}
+
+type dynamicProxyHandle struct {
+	ProxyAddress string
+	close        func() error
+}
+
+func (h dynamicProxyHandle) Close() error {
+	if h.close == nil {
+		return nil
+	}
+	return h.close()
+}
 
 type nodeTestCancel struct {
 	cancel context.CancelFunc
@@ -81,6 +107,83 @@ type batchNodeTest struct {
 	cancelledNodes map[string]struct{}
 }
 
+type proxyCacheEntry struct {
+	NodeID      string
+	CountryCode string
+	EntryIP     string
+	ExitIP      string
+	IPType      string
+	Residential bool
+	Available   bool
+	LatencyMS   int
+	Message     string
+	UpdatedAt   time.Time
+	ExpiresAt   time.Time
+}
+
+type dynamicProxyAllocation struct {
+	ID            string
+	NodeID        string
+	CountryCode   string
+	EntryIP       string
+	ExitIP        string
+	IPType        string
+	ListenAddress string
+	ConnectHost   string
+	ConnectPort   int
+	Username      string
+	Password      string
+	ProxyURL      string
+	CreatedAt     time.Time
+	ExpiresAt     time.Time
+	Handle        dynamicProxyHandle
+}
+
+type proxyAllocationCandidate struct {
+	Node  vpngate.Node
+	Cache proxyCacheEntry
+}
+
+type ProxyAllocateRequest struct {
+	CountryCode string `json:"country_code"`
+}
+
+type ProxyAllocateResponse struct {
+	OK           bool   `json:"ok"`
+	AllocationID string `json:"allocation_id"`
+	Scheme       string `json:"scheme"`
+	Host         string `json:"host"`
+	Port         int    `json:"port"`
+	Username     string `json:"username"`
+	Password     string `json:"password"`
+	ProxyURL     string `json:"proxy_url"`
+	CountryCode  string `json:"country_code"`
+	EntryIP      string `json:"entry_ip,omitempty"`
+	ExitIP       string `json:"exit_ip"`
+	IPType       string `json:"ip_type"`
+	NodeID       string `json:"node_id"`
+	LatencyMS    int    `json:"latency_ms,omitempty"`
+	ExpiresAt    string `json:"expires_at"`
+}
+
+type ProxyReleaseRequest struct {
+	AllocationID string `json:"allocation_id"`
+}
+
+type ProxyReleaseResponse struct {
+	OK           bool   `json:"ok"`
+	AllocationID string `json:"allocation_id"`
+	Released     bool   `json:"released"`
+	Message      string `json:"message,omitempty"`
+}
+
+var (
+	errProxyCacheUnavailable   = errors.New("代理质量缓存为空，请等待周期同步完成")
+	errProxyCountryUnavailable = errors.New("没有匹配国家代码的可用代理")
+	errProxyUnavailable        = errors.New("没有满足家宽类型和去重窗口要求的可用代理")
+	errProxyReleaseInProgress  = errors.New("动态代理入口正在释放")
+)
+
 type Server struct {
 	configPath string
 	config     Config
@@ -98,6 +201,13 @@ type Server struct {
 	failed       map[string]string
 	batchTest    *batchNodeTest
 	nodeTests    map[string]nodeTestCancel
+
+	proxyCache           map[string]proxyCacheEntry
+	proxyCacheRefreshing bool
+	dynamicProxies       map[string]dynamicProxyAllocation
+	releasingProxies     map[string]struct{}
+	recentExitIPs        map[string]time.Time
+	startDynamicProxy    dynamicProxyStarter
 }
 
 type authSession struct {
@@ -212,16 +322,22 @@ func NewServer(configPath string, config Config, logger *slog.Logger, logBuffer 
 	if len(logBuffer) > 0 {
 		buffer = logBuffer[0]
 	}
-	return &Server{
-		configPath:   configPath,
-		config:       config,
-		logger:       logger,
-		logBuffer:    buffer,
-		webRoot:      defaultWebRoot(),
-		authSessions: map[string]authSession{},
-		failed:       map[string]string{},
-		nodeTests:    map[string]nodeTestCancel{},
+	server := &Server{
+		configPath:       configPath,
+		config:           config,
+		logger:           logger,
+		logBuffer:        buffer,
+		webRoot:          defaultWebRoot(),
+		authSessions:     map[string]authSession{},
+		failed:           map[string]string{},
+		nodeTests:        map[string]nodeTestCancel{},
+		proxyCache:       map[string]proxyCacheEntry{},
+		dynamicProxies:   map[string]dynamicProxyAllocation{},
+		releasingProxies: map[string]struct{}{},
+		recentExitIPs:    map[string]time.Time{},
 	}
+	server.startDynamicProxy = server.startDynamicProxyBackend
+	return server
 }
 
 func (s *Server) SetWebRoot(webRoot string) error {
@@ -305,6 +421,16 @@ func (s *Server) route(w http.ResponseWriter, r *http.Request) {
 		s.logout(w, r)
 	case r.Method == http.MethodGet && path == "/api/session":
 		s.sessionState(w, r)
+	case r.Method == http.MethodPost && path == "/api/proxy/allocate":
+		if !s.requireAPITokenAuth(w, r, config) {
+			return
+		}
+		s.allocateProxy(w, r)
+	case r.Method == http.MethodPost && path == "/api/proxy/release":
+		if !s.requireAPITokenAuth(w, r, config) {
+			return
+		}
+		s.releaseProxy(w, r)
 	case r.Method == http.MethodGet && path == "/api/state":
 		if !s.requireAuth(w, r) {
 			return
@@ -457,6 +583,392 @@ func (s *Server) testProxy(w http.ResponseWriter) {
 	s.sendJSONWithStatus(w, status, response)
 }
 
+func (s *Server) allocateProxy(w http.ResponseWriter, r *http.Request) {
+	var request ProxyAllocateRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&request); err != nil {
+		s.sendError(w, http.StatusBadRequest, "请求体不是有效 JSON")
+		return
+	}
+	countryCode := strings.ToUpper(strings.TrimSpace(request.CountryCode))
+	if !validAPICountryCode(countryCode) {
+		s.sendError(w, http.StatusBadRequest, "国家代码必须是 2 位字母")
+		return
+	}
+
+	now := time.Now()
+	candidate, leaseDuration, listenHost, authFilePath, err := s.reserveProxyCandidate(countryCode, now)
+	if err != nil {
+		status := http.StatusConflict
+		if errors.Is(err, errProxyCountryUnavailable) || errors.Is(err, errProxyCacheUnavailable) {
+			status = http.StatusBadGateway
+		}
+		s.sendJSONWithStatus(w, status, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+
+	listener, username, password, err := dynamicProxyListener(listenHost)
+	if err != nil {
+		s.sendError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	listener.Username = username
+	listener.Password = password
+
+	configPath, err := s.writeNodeConfig(candidate.Node)
+	if err != nil {
+		s.releaseReservedExitIP(candidate.Cache.ExitIP)
+		s.sendError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	startCtx, cancel := context.WithTimeout(context.Background(), gatewayconfig.DefaultHandshakeTimeout+10*time.Second)
+	defer cancel()
+	handle, err := s.startDynamicProxy(startCtx, dynamicProxyStartOptions{
+		Listener:         listener,
+		ConfigPath:       configPath,
+		AuthFilePath:     authFilePath,
+		ConnectTimeout:   gatewayconfig.DefaultConnectTimeout,
+		HandshakeTimeout: gatewayconfig.DefaultHandshakeTimeout,
+		NodeID:           candidate.Node.ID,
+	})
+	if err != nil {
+		s.releaseReservedExitIP(candidate.Cache.ExitIP)
+		s.markNodeProbeFailed(candidate.Node.ID, err.Error())
+		s.sendJSONWithStatus(w, http.StatusBadGateway, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+
+	allocation, err := s.commitProxyAllocation(candidate, listener, handle, username, password, leaseDuration, now, externalProxyHost(r))
+	if err != nil {
+		_ = handle.Close()
+		s.releaseReservedExitIP(candidate.Cache.ExitIP)
+		s.sendError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	s.sendJSON(w, proxyAllocateResponse(allocation, candidate.Cache.LatencyMS))
+}
+
+func (s *Server) releaseProxy(w http.ResponseWriter, r *http.Request) {
+	var request ProxyReleaseRequest
+	if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&request); err != nil {
+		s.sendError(w, http.StatusBadRequest, "请求体不是有效 JSON")
+		return
+	}
+	allocationID := strings.TrimSpace(request.AllocationID)
+	if allocationID == "" {
+		s.sendError(w, http.StatusBadRequest, "分配 ID 不能为空")
+		return
+	}
+	released, err := s.releaseProxyAllocation(allocationID)
+	if err != nil {
+		s.sendError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	message := "动态代理入口已释放"
+	if !released {
+		message = "动态代理入口不存在或已释放"
+	}
+	s.sendJSON(w, ProxyReleaseResponse{
+		OK:           true,
+		AllocationID: allocationID,
+		Released:     released,
+		Message:      message,
+	})
+}
+
+func (s *Server) reserveProxyCandidate(countryCode string, now time.Time) (proxyAllocationCandidate, time.Duration, string, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupProxyStateLocked(now)
+	leaseDuration := time.Duration(s.config.ProxyLeaseSeconds) * time.Second
+	listenHost := s.config.ProxyListenHost
+	authFilePath := s.config.OpenVPNAuth
+	if len(s.proxyCache) == 0 {
+		return proxyAllocationCandidate{}, leaseDuration, listenHost, authFilePath, errProxyCacheUnavailable
+	}
+	var countryMatched bool
+	for _, node := range s.nodes {
+		cache, ok := s.proxyCache[node.ID]
+		if !ok || cache.ExpiresAt.Before(now) || !cache.ExpiresAt.After(now) {
+			continue
+		}
+		if !strings.EqualFold(cache.CountryCode, countryCode) {
+			continue
+		}
+		countryMatched = true
+		if !cache.Available || !proxyCacheEntryIsResidential(cache) {
+			continue
+		}
+		if net.ParseIP(cache.ExitIP) == nil {
+			continue
+		}
+		if reservedAt, reserved := s.recentExitIPs[cache.ExitIP]; reserved && now.Sub(reservedAt) < proxyReuseWindow {
+			continue
+		}
+		if node.ConfigText == "" {
+			continue
+		}
+		s.recentExitIPs[cache.ExitIP] = now
+		return proxyAllocationCandidate{Node: node, Cache: cache}, leaseDuration, listenHost, authFilePath, nil
+	}
+	if !countryMatched {
+		return proxyAllocationCandidate{}, leaseDuration, listenHost, authFilePath, errProxyCountryUnavailable
+	}
+	return proxyAllocationCandidate{}, leaseDuration, listenHost, authFilePath, errProxyUnavailable
+}
+
+func proxyCacheEntryIsResidential(entry proxyCacheEntry) bool {
+	return entry.Residential || strings.EqualFold(entry.IPType, "broadband")
+}
+
+func (s *Server) releaseReservedExitIP(exitIP string) {
+	exitIP = strings.TrimSpace(exitIP)
+	if exitIP == "" {
+		return
+	}
+	s.mu.Lock()
+	delete(s.recentExitIPs, exitIP)
+	s.mu.Unlock()
+}
+
+func dynamicProxyListener(listenHost string) (gatewayconfig.Listener, string, string, error) {
+	listenHost = strings.TrimSpace(listenHost)
+	if listenHost == "" {
+		return gatewayconfig.Listener{}, "", "", errors.New("动态代理监听地址不能为空")
+	}
+	username := "api-" + randomHex(6)
+	password := randomHex(18)
+	listener := gatewayconfig.NewListener("api-"+randomHex(4), listenHost, 0, true)
+	listener.Username = username
+	listener.Password = password
+	return listener, username, password, nil
+}
+
+func (s *Server) commitProxyAllocation(candidate proxyAllocationCandidate, listener gatewayconfig.Listener, handle dynamicProxyHandle, username string, password string, leaseDuration time.Duration, now time.Time, advertiseHost string) (dynamicProxyAllocation, error) {
+	proxyAddress := strings.TrimSpace(handle.ProxyAddress)
+	if proxyAddress == "" {
+		return dynamicProxyAllocation{}, errors.New("动态 SOCKS5 入口未返回监听地址")
+	}
+	connectAddress := proxyConnectAddress(proxyAddress, advertiseHost)
+	host, portText, err := net.SplitHostPort(connectAddress)
+	if err != nil {
+		return dynamicProxyAllocation{}, fmt.Errorf("动态 SOCKS5 入口监听地址无效: %w", err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port <= 0 || port > 65535 {
+		return dynamicProxyAllocation{}, fmt.Errorf("动态 SOCKS5 入口端口无效: %s", portText)
+	}
+	proxyURL := listenerProxyURL(gatewayconfig.Listener{Username: username, Password: password}, connectAddress)
+	id, err := newSessionToken()
+	if err != nil {
+		return dynamicProxyAllocation{}, fmt.Errorf("生成动态代理分配 ID 失败: %w", err)
+	}
+	allocation := dynamicProxyAllocation{
+		ID:            id,
+		NodeID:        candidate.Node.ID,
+		CountryCode:   candidate.Cache.CountryCode,
+		EntryIP:       candidate.Cache.EntryIP,
+		ExitIP:        candidate.Cache.ExitIP,
+		IPType:        candidate.Cache.IPType,
+		ListenAddress: proxyAddress,
+		ConnectHost:   host,
+		ConnectPort:   port,
+		Username:      username,
+		Password:      password,
+		ProxyURL:      proxyURL,
+		CreatedAt:     now,
+		ExpiresAt:     now.Add(leaseDuration),
+		Handle:        handle,
+	}
+	s.mu.Lock()
+	s.dynamicProxies[allocation.ID] = allocation
+	s.mu.Unlock()
+	return allocation, nil
+}
+
+func proxyConnectAddress(proxyAddress string, advertiseHost string) string {
+	host, port, err := net.SplitHostPort(proxyAddress)
+	if err != nil {
+		return proxyAddress
+	}
+	ip := net.ParseIP(host)
+	if ip != nil && ip.IsUnspecified() {
+		if value := strings.TrimSpace(advertiseHost); value != "" {
+			host = value
+		}
+	}
+	return net.JoinHostPort(host, port)
+}
+
+func externalProxyHost(r *http.Request) string {
+	for _, value := range []string{
+		r.Header.Get("X-Forwarded-Host"),
+		r.Header.Get("X-Real-Host"),
+		r.Host,
+	} {
+		host := firstForwardedHost(value)
+		if host == "" {
+			continue
+		}
+		if parsedHost, _, err := net.SplitHostPort(host); err == nil {
+			host = parsedHost
+		}
+		host = strings.Trim(host, "[]")
+		if host != "" {
+			return host
+		}
+	}
+	return ""
+}
+
+func firstForwardedHost(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if idx := strings.Index(value, ","); idx >= 0 {
+		value = value[:idx]
+	}
+	return strings.TrimSpace(value)
+}
+
+func validAPICountryCode(value string) bool {
+	value = strings.TrimSpace(value)
+	if len(value) != 2 {
+		return false
+	}
+	for _, ch := range value {
+		if ch >= 'a' && ch <= 'z' {
+			continue
+		}
+		if ch >= 'A' && ch <= 'Z' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func proxyAllocateResponse(allocation dynamicProxyAllocation, latencyMS int) ProxyAllocateResponse {
+	return ProxyAllocateResponse{
+		OK:           true,
+		AllocationID: allocation.ID,
+		Scheme:       "socks5h",
+		Host:         allocation.ConnectHost,
+		Port:         allocation.ConnectPort,
+		Username:     allocation.Username,
+		Password:     allocation.Password,
+		ProxyURL:     allocation.ProxyURL,
+		CountryCode:  allocation.CountryCode,
+		EntryIP:      allocation.EntryIP,
+		ExitIP:       allocation.ExitIP,
+		IPType:       allocation.IPType,
+		NodeID:       allocation.NodeID,
+		LatencyMS:    latencyMS,
+		ExpiresAt:    allocation.ExpiresAt.Format(time.RFC3339),
+	}
+}
+
+func (s *Server) releaseProxyAllocation(allocationID string) (bool, error) {
+	allocationID = strings.TrimSpace(allocationID)
+	if allocationID == "" {
+		return false, nil
+	}
+	s.mu.Lock()
+	allocation, ok := s.dynamicProxies[allocationID]
+	if ok {
+		if _, releasing := s.releasingProxies[allocationID]; releasing {
+			s.mu.Unlock()
+			return true, errProxyReleaseInProgress
+		}
+		s.releasingProxies[allocationID] = struct{}{}
+	}
+	s.mu.Unlock()
+	if !ok {
+		return false, nil
+	}
+	defer func() {
+		s.mu.Lock()
+		delete(s.releasingProxies, allocationID)
+		s.mu.Unlock()
+	}()
+	if err := allocation.Handle.Close(); err != nil {
+		return true, fmt.Errorf("释放动态代理入口失败: %w", err)
+	}
+	s.mu.Lock()
+	if current, exists := s.dynamicProxies[allocationID]; exists && current.ID == allocation.ID {
+		delete(s.dynamicProxies, allocationID)
+	}
+	s.mu.Unlock()
+	return true, nil
+}
+
+func (s *Server) cleanupProxyStateLocked(now time.Time) {
+	for nodeID, entry := range s.proxyCache {
+		if !entry.ExpiresAt.After(now) {
+			delete(s.proxyCache, nodeID)
+		}
+	}
+	for exitIP, allocatedAt := range s.recentExitIPs {
+		if now.Sub(allocatedAt) >= proxyReuseWindow {
+			delete(s.recentExitIPs, exitIP)
+		}
+	}
+}
+
+func (s *Server) startDynamicProxyBackend(ctx context.Context, options dynamicProxyStartOptions) (dynamicProxyHandle, error) {
+	logger := s.logger.With("dynamic_proxy", true, "node", options.NodeID)
+	tunnel, err := vpn.Start(ctx, vpn.StartOptions{
+		ConfigPath:       options.ConfigPath,
+		AuthFilePath:     options.AuthFilePath,
+		HandshakeTimeout: options.HandshakeTimeout,
+		Logger:           logger,
+	})
+	if err != nil {
+		return dynamicProxyHandle{}, fmt.Errorf("启动动态代理 OpenVPN 后端失败: %w", err)
+	}
+
+	backendCtx, cancel := context.WithCancel(context.Background())
+	dialer, err := vpn.NewDialer(backendCtx, tunnel, logger)
+	if err != nil {
+		cancel()
+		_ = tunnel.Close()
+		return dynamicProxyHandle{}, fmt.Errorf("初始化动态代理 TCP/IP 栈失败: %w", err)
+	}
+
+	server := socks.NewServer(
+		options.Listener.ListenAddress(),
+		dialer,
+		options.ConnectTimeout,
+		logger,
+		socks.AuthConfig{Username: options.Listener.Username, Password: options.Listener.Password},
+	)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- server.Serve(backendCtx)
+	}()
+	proxyAddress, err := waitSocksAddress(ctx, server, errCh)
+	if err != nil {
+		cancel()
+		_ = server.Close()
+		_ = dialer.Close()
+		return dynamicProxyHandle{}, err
+	}
+	return dynamicProxyHandle{
+		ProxyAddress: proxyAddress,
+		close: func() error {
+			cancel()
+			serverErr := server.Close()
+			dialerErr := dialer.Close()
+			if serverErr != nil && !errors.Is(serverErr, net.ErrClosed) {
+				return serverErr
+			}
+			return dialerErr
+		},
+	}, nil
+}
+
 func (s *Server) configSnapshot() Config {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -577,6 +1089,40 @@ func (s *Server) requireAuth(w http.ResponseWriter, r *http.Request) bool {
 		"error": "未登录或登录已过期",
 	})
 	return false
+}
+
+func (s *Server) requireAPITokenAuth(w http.ResponseWriter, r *http.Request, config Config) bool {
+	if strings.TrimSpace(config.APITokenHash) == "" {
+		s.sendJSONWithStatus(w, http.StatusForbidden, map[string]any{
+			"ok":    false,
+			"error": "机器 API Token 未配置",
+		})
+		return false
+	}
+	token := bearerToken(r.Header.Get("Authorization"))
+	if token == "" {
+		token = strings.TrimSpace(r.Header.Get("X-AkiraGate-Token"))
+	}
+	if token != "" && verifyAPIToken(config.APITokenHash, token) {
+		return true
+	}
+	s.sendJSONWithStatus(w, http.StatusUnauthorized, map[string]any{
+		"ok":    false,
+		"error": "机器 API Token 无效",
+	})
+	return false
+}
+
+func bearerToken(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	prefix := "Bearer "
+	if len(value) <= len(prefix) || !strings.EqualFold(value[:len(prefix)], prefix) {
+		return ""
+	}
+	return strings.TrimSpace(value[len(prefix):])
 }
 
 func (s *Server) authSession(r *http.Request) (authSession, bool) {
@@ -758,6 +1304,10 @@ func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	currentHash := s.config.AdminPasswordHash
 	currentUsername := s.config.AdminUsername
+	currentAPITokenHash := s.config.APITokenHash
+	currentProxyCacheTTL := s.config.ProxyCacheTTL
+	currentProxyLeaseSeconds := s.config.ProxyLeaseSeconds
+	currentProxyListenHost := s.config.ProxyListenHost
 	s.mu.Unlock()
 	passwordChanged := strings.TrimSpace(next.AdminPassword) != ""
 	if passwordChanged {
@@ -771,6 +1321,18 @@ func (s *Server) updateSettings(w http.ResponseWriter, r *http.Request) {
 		next.AdminPasswordHash = currentHash
 	}
 	next.AdminPassword = ""
+	if strings.TrimSpace(next.APIToken) == "" && strings.TrimSpace(next.APITokenHash) == "" {
+		next.APITokenHash = currentAPITokenHash
+	}
+	if next.ProxyCacheTTL <= 0 {
+		next.ProxyCacheTTL = currentProxyCacheTTL
+	}
+	if next.ProxyLeaseSeconds <= 0 {
+		next.ProxyLeaseSeconds = currentProxyLeaseSeconds
+	}
+	if strings.TrimSpace(next.ProxyListenHost) == "" {
+		next.ProxyListenHost = currentProxyListenHost
+	}
 	normalizeConfig(&next)
 	if err := SaveConfig(s.configPath, next); err != nil {
 		s.sendError(w, http.StatusBadRequest, err.Error())
@@ -1968,6 +2530,8 @@ func (s *Server) finishSession(session *Session, status string, message string) 
 func (s *Server) maintenanceLoop(ctx context.Context) {
 	s.refreshNodesInBackground()
 	s.tryAutoConnect()
+	s.refreshProxyCacheInBackground(ctx)
+	go s.proxyJanitorLoop(ctx)
 
 	for {
 		timer := time.NewTimer(s.refreshInterval())
@@ -1978,6 +2542,62 @@ func (s *Server) maintenanceLoop(ctx context.Context) {
 		case <-timer.C:
 			s.refreshNodesInBackground()
 			s.tryAutoConnect()
+			s.refreshProxyCacheInBackground(ctx)
+		}
+	}
+}
+
+func (s *Server) proxyJanitorLoop(ctx context.Context) {
+	ticker := time.NewTicker(proxyJanitorInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			s.releaseAllDynamicProxies()
+			return
+		case <-ticker.C:
+			s.cleanupExpiredProxyAllocations(time.Now())
+		}
+	}
+}
+
+func (s *Server) cleanupExpiredProxyAllocations(now time.Time) {
+	var expired []dynamicProxyAllocation
+	s.mu.Lock()
+	for id, allocation := range s.dynamicProxies {
+		if _, releasing := s.releasingProxies[id]; releasing {
+			continue
+		}
+		if !allocation.ExpiresAt.After(now) {
+			expired = append(expired, allocation)
+			delete(s.dynamicProxies, id)
+		}
+	}
+	s.cleanupProxyStateLocked(now)
+	s.mu.Unlock()
+	for _, allocation := range expired {
+		if err := allocation.Handle.Close(); err != nil {
+			s.logger.Warn("自动释放动态代理入口失败", "allocation", allocation.ID, "error", err)
+			s.mu.Lock()
+			if _, exists := s.dynamicProxies[allocation.ID]; !exists {
+				s.dynamicProxies[allocation.ID] = allocation
+			}
+			s.mu.Unlock()
+		}
+	}
+}
+
+func (s *Server) releaseAllDynamicProxies() {
+	var allocations []dynamicProxyAllocation
+	s.mu.Lock()
+	for id, allocation := range s.dynamicProxies {
+		allocations = append(allocations, allocation)
+		delete(s.dynamicProxies, id)
+	}
+	s.mu.Unlock()
+	for _, allocation := range allocations {
+		if err := allocation.Handle.Close(); err != nil {
+			s.logger.Warn("停止管理服务时释放动态代理入口失败", "allocation", allocation.ID, "error", err)
 		}
 	}
 }
@@ -2004,9 +2624,150 @@ func (s *Server) refreshNodesInBackground() {
 		_, active := activeIDs[nodes[idx].ID]
 		nodes[idx].Active = active
 	}
-	s.nodes = nodes
+	s.nodes = s.mergeRetainedNodesLocked(nodes, time.Now())
 	s.mu.Unlock()
 	s.logger.Info("VPNGate 节点已刷新", "count", len(nodes))
+}
+
+func (s *Server) mergeRetainedNodesLocked(fresh []vpngate.Node, now time.Time) []vpngate.Node {
+	if len(s.nodes) == 0 {
+		return fresh
+	}
+	seen := make(map[string]struct{}, len(fresh))
+	for _, node := range fresh {
+		if node.ID != "" {
+			seen[node.ID] = struct{}{}
+		}
+	}
+	retainedIDs := s.retainedNodeIDsLocked(now)
+	if len(retainedIDs) == 0 {
+		return fresh
+	}
+	merged := append([]vpngate.Node(nil), fresh...)
+	for _, node := range s.nodes {
+		if node.ID == "" {
+			continue
+		}
+		if _, exists := seen[node.ID]; exists {
+			continue
+		}
+		if _, retain := retainedIDs[node.ID]; !retain {
+			continue
+		}
+		merged = append(merged, node)
+		seen[node.ID] = struct{}{}
+	}
+	return merged
+}
+
+func (s *Server) retainedNodeIDsLocked(now time.Time) map[string]struct{} {
+	retained := map[string]struct{}{}
+	for nodeID := range s.activeNodeIDsLocked() {
+		retained[nodeID] = struct{}{}
+	}
+	for _, allocation := range s.dynamicProxies {
+		if allocation.NodeID != "" {
+			retained[allocation.NodeID] = struct{}{}
+		}
+	}
+	for nodeID, cache := range s.proxyCache {
+		if cache.ExpiresAt.After(now) {
+			retained[nodeID] = struct{}{}
+		}
+	}
+	return retained
+}
+
+func (s *Server) refreshProxyCacheInBackground(ctx context.Context) {
+	s.mu.Lock()
+	if s.proxyCacheRefreshing {
+		s.mu.Unlock()
+		return
+	}
+	s.proxyCacheRefreshing = true
+	s.mu.Unlock()
+
+	go func() {
+		defer func() {
+			s.mu.Lock()
+			s.proxyCacheRefreshing = false
+			s.mu.Unlock()
+		}()
+		s.refreshProxyCache(ctx)
+	}()
+}
+
+func (s *Server) refreshProxyCache(ctx context.Context) {
+	nodeIDs := s.proxyCacheRefreshCandidates(time.Now(), maxBatchNodeTests)
+	if len(nodeIDs) == 0 {
+		return
+	}
+	s.markBatchNodesProbeTesting(nodeIDs)
+	results, cancelled := s.probeNodesConcurrently(ctx, nodeIDs)
+	if cancelled {
+		s.logger.Warn("代理质量缓存刷新被取消")
+	}
+	s.updateProxyCacheFromProbeResults(results, time.Now())
+}
+
+func (s *Server) proxyCacheRefreshCandidates(now time.Time, limit int) []string {
+	if limit <= 0 {
+		limit = maxBatchNodeTests
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleanupProxyStateLocked(now)
+	var ids []string
+	for _, node := range s.nodes {
+		if node.ID == "" || node.ConfigText == "" || nodeFailed(node.ID, s.failed) {
+			continue
+		}
+		cache, cached := s.proxyCache[node.ID]
+		if cached && cache.ExpiresAt.After(now) {
+			continue
+		}
+		ids = append(ids, node.ID)
+		if len(ids) >= limit {
+			break
+		}
+	}
+	return ids
+}
+
+func (s *Server) updateProxyCacheFromProbeResults(nodes []vpngate.Node, now time.Time) {
+	if len(nodes) == 0 {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ttl := time.Duration(s.config.ProxyCacheTTL) * time.Second
+	if ttl <= 0 {
+		ttl = time.Hour
+	}
+	for _, node := range nodes {
+		if node.ID == "" {
+			continue
+		}
+		entry := proxyCacheEntry{
+			NodeID:      node.ID,
+			CountryCode: strings.ToUpper(strings.TrimSpace(node.CountryShort)),
+			EntryIP:     listenerNodeEntryIP(node),
+			Available:   node.ProbeStatus == "available",
+			LatencyMS:   node.ProbeLatency,
+			Message:     node.ProbeMessage,
+			UpdatedAt:   now,
+			ExpiresAt:   now.Add(ttl),
+		}
+		if node.ExitIPInfo != nil {
+			entry.ExitIP = strings.TrimSpace(node.ExitIPInfo.IP)
+			entry.IPType = strings.TrimSpace(node.ExitIPInfo.IPType)
+			entry.Residential = node.ExitIPInfo.Residential
+			if node.ExitIPInfo.CountryCode != "" {
+				entry.CountryCode = strings.ToUpper(strings.TrimSpace(node.ExitIPInfo.CountryCode))
+			}
+		}
+		s.proxyCache[node.ID] = entry
+	}
 }
 
 func (s *Server) tryAutoConnect() {

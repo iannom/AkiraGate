@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -29,8 +30,52 @@ func TestDefaultConfigUsesAuthenticatedSocksListener(t *testing.T) {
 	if !listener.HasAuth() {
 		t.Fatal("默认 SOCKS5 监听必须启用用户名密码鉴权")
 	}
+	if config.ProxyListenHost != "0.0.0.0" || config.ProxyLeaseSeconds != 3600 || config.ProxyCacheTTL != 3600 {
+		t.Fatalf("默认动态代理配置不符合预期: %+v", config)
+	}
 	if err := ValidateConfig(config); err != nil {
 		t.Fatalf("默认配置应通过校验: %v", err)
+	}
+}
+
+func TestLoadConfigMigratesPlainAPITokenToHash(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	data := []byte(`{
+  "web_host": "127.0.0.1",
+  "web_port": 8787,
+  "secret_path": "secret",
+  "admin_username": "admin",
+  "admin_password": "password",
+  "api_token": "machine-token",
+  "openvpn_config": "",
+  "auto_connect": false,
+  "refresh_seconds": 960,
+  "routing_mode": "auto",
+  "socks5_listeners": [
+    {"name": "local", "host": "127.0.0.1", "port": 7928, "username": "proxy", "password": "password", "enabled": true}
+  ]
+}`)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("写入测试配置失败: %v", err)
+	}
+
+	config, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("读取带明文 API Token 的配置失败: %v", err)
+	}
+	if config.APIToken != "" {
+		t.Fatal("加载后不应保留明文 API Token")
+	}
+	if !verifyAPIToken(config.APITokenHash, "machine-token") {
+		t.Fatal("迁移后的 API Token 哈希应可通过校验")
+	}
+
+	stored, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读取迁移后配置失败: %v", err)
+	}
+	if bytes.Contains(stored, []byte(`"api_token"`)) {
+		t.Fatalf("迁移后配置不应保留明文 API Token: %s", string(stored))
 	}
 }
 

@@ -32,6 +32,8 @@ bash <(curl -Ls https://raw.githubusercontent.com/iannom/AkiraGate/main/install.
 - Web 管理页面可刷新 VPNGate 官方节点列表、测试节点连通性，并选择节点建立用户态 OpenVPN 连接。
 - Web 管理页面可检测 SOCKS5 出口 IP、查看网关组件状态和运行日志。
 - 后台可定时刷新 VPNGate 节点；启动自动连接仅用于已配置的本地 OpenVPN 配置文件。
+- 机器 API 可按国家码分配公网可访问的临时 SOCKS5 入口，只返回真实出口为家宽类型的代理；同一出口 IP 1 小时内不会重复分配。
+- 临时 SOCKS5 入口支持释放 API；未释放时默认 60 分钟后自动释放。
 
 ## 配置文件
 
@@ -50,10 +52,14 @@ bash <(curl -Ls https://raw.githubusercontent.com/iannom/AkiraGate/main/install.
   "secret_path": "examplepath",
   "admin_username": "admin",
   "admin_password_hash": "$2a$10$example-bcrypt-hash",
+  "api_token_hash": "$2a$10$example-bcrypt-token-hash",
   "openvpn_config": "/opt/akiragate/client.ovpn",
   "openvpn_auth": "/opt/akiragate/akiragate_data/vpngate_auth.txt",
   "auto_connect": false,
   "refresh_seconds": 960,
+  "proxy_cache_ttl_seconds": 3600,
+  "proxy_lease_seconds": 3600,
+  "proxy_listen_host": "0.0.0.0",
   "routing_mode": "auto",
   "force_country": "",
   "fixed_node_id": "",
@@ -78,7 +84,7 @@ bash <(curl -Ls https://raw.githubusercontent.com/iannom/AkiraGate/main/install.
 }
 ```
 
-`admin_password_hash` 由服务首次读取明文初始密码或在 Web 页面修改密码时自动生成。`openvpn_config` 可用于手动连接本地 OpenVPN 配置文件；`auto_connect` 只会在已设置可读 `openvpn_config` 时于服务启动后自动连接。也可以在 Web 页面点击“刷新 VPNGate 节点”，手动选择公开节点连接。
+`admin_password_hash` 由服务首次读取明文初始密码或在 Web 页面修改密码时自动生成。`api_token_hash` 由服务首次读取明文 `api_token` 后自动生成；安装脚本会输出初始机器 API Token，请妥善保存。`openvpn_config` 可用于手动连接本地 OpenVPN 配置文件；`auto_connect` 只会在已设置可读 `openvpn_config` 时于服务启动后自动连接。也可以在 Web 页面点击“刷新 VPNGate 节点”，手动选择公开节点连接。
 
 ## 使用 SOCKS5
 
@@ -92,6 +98,26 @@ curl -x socks5h://proxy:local-pass@127.0.0.1:7928 https://api.ipify.org
 
 ```bash
 curl -x socks5h://proxyuser:proxypass@127.0.0.1:7929 https://api.ipify.org
+```
+
+## 机器 API
+
+分配一个日本家宽出口的临时 SOCKS5 入口：
+
+```bash
+curl -X POST "http://<服务器IP>:8787/<secret_path>/api/proxy/allocate" \
+  -H "Authorization: Bearer <api_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"country_code":"JP"}'
+```
+
+响应会包含 `allocation_id`、`proxy_url`、`host`、`port`、`username`、`password`、`exit_ip` 和 `expires_at`。释放入口：
+
+```bash
+curl -X POST "http://<服务器IP>:8787/<secret_path>/api/proxy/release" \
+  -H "Authorization: Bearer <api_token>" \
+  -H "Content-Type: application/json" \
+  -d '{"allocation_id":"<allocation_id>"}'
 ```
 
 ## 管理命令
