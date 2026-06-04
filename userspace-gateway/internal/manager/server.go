@@ -2554,6 +2554,11 @@ func fetchIPPureInfo(ctx context.Context, client *http.Client, infoURL string) (
 		FetchedAt:      time.Now().Format(time.RFC3339),
 	}
 	info.IPType = classifyIPType(info)
+	if info.IPType == "unknown" {
+		// IPPure 测试版响应可能缺少明确类型字段；业务上将未识别类型按机房 IP 处理。
+		info.Hosting = true
+		info.IPType = "datacenter"
+	}
 	return info, nil
 }
 

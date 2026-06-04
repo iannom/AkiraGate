@@ -648,6 +648,27 @@ func TestFetchIPPureInfoParsesExitProfile(t *testing.T) {
 	}
 }
 
+func TestFetchIPPureInfoDefaultsMissingTypeToDatacenter(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"ip":"203.0.113.11",
+			"asn":64501,
+			"asOrganization":"Example Hosting",
+			"countryCode":"JP"
+		}`))
+	}))
+	defer upstream.Close()
+
+	info, err := fetchIPPureInfo(t.Context(), upstream.Client(), upstream.URL)
+	if err != nil {
+		t.Fatalf("解析 ippure 出口画像失败: %v", err)
+	}
+	if info.IPType != "datacenter" || !info.Hosting {
+		t.Fatalf("ippure 未返回 IP 类型时应标记为机房 IP: %+v", info)
+	}
+}
+
 func TestTestNodeRejectsMissingNodeID(t *testing.T) {
 	server := testServer(t)
 	req := httptest.NewRequest(http.MethodPost, "/secret/api/test_node", bytes.NewReader([]byte(`{}`)))
