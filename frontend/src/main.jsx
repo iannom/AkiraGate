@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
+  ArrowUpDown,
   CircleX,
   CheckSquare,
   ClipboardList,
@@ -9,6 +10,11 @@ import {
   CirclePlus,
   ChevronsLeft,
   ChevronsRight,
+  Copy,
+  CopyCheck,
+  Dices,
+  Eye,
+  EyeOff,
   Globe2,
   ListRestart,
   LoaderCircle,
@@ -118,6 +124,28 @@ const ipTypeOptions = [
   ["proxy", "代理/VPN"],
   ["datacenter", "数据中心"],
 ];
+const nodeSortColumns = Object.freeze([
+  { key: "country", label: "国家" },
+  { key: "endpoint", label: "节点地址" },
+  { key: "probe", label: "状态" },
+  { key: "exit", label: "真实出口测试" },
+  { key: "network", label: "ASN / 运营商" },
+]);
+const nodeSortColumnKeys = new Set(nodeSortColumns.map((column) => column.key));
+const defaultNodeSort = Object.freeze({ key: "", direction: "asc" });
+const nodeSortDirectionLabels = Object.freeze({ asc: "升序", desc: "降序" });
+const nodeSortCollator = new Intl.Collator("zh-CN", { numeric: true, sensitivity: "base" });
+const nodeProbeStatusRank = Object.freeze({
+  available: 0,
+  testing: 1,
+  not_checked: 2,
+  cancelled: 3,
+  unavailable: 4,
+});
+const socksCredentialUsernameAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+const socksCredentialPasswordAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.~";
+const socksCredentialUsernameLength = 12;
+const socksCredentialPasswordLength = 24;
 
 const localFlagUrls = Object.freeze({
   jp: flagJpUrl,
@@ -142,6 +170,204 @@ function countryCodeToFlagEmoji(normalizedCode) {
 function formatFlagFallbackText(code) {
   const fallback = String(code || "--").trim().slice(0, 2).toUpperCase();
   return fallback || "--";
+}
+
+function getCryptoRandomValues(buffer) {
+  const cryptoSource = globalThis.crypto;
+  if (!cryptoSource || typeof cryptoSource.getRandomValues !== "function") {
+    throw new Error("当前浏览器不支持安全随机数生成。");
+  }
+  cryptoSource.getRandomValues(buffer);
+  return buffer;
+}
+
+function randomString(length, alphabet) {
+  if (!Number.isInteger(length) || length <= 0) {
+    throw new Error("随机字符串长度必须是正整数。");
+  }
+  if (typeof alphabet !== "string" || alphabet.length < 2 || alphabet.length > 256) {
+    throw new Error("随机字符串字符集无效。");
+  }
+
+  const output = [];
+  const maxAcceptedByte = Math.floor(256 / alphabet.length) * alphabet.length;
+  while (output.length < length) {
+    const bytes = getCryptoRandomValues(new Uint8Array(length - output.length));
+    for (const byte of bytes) {
+      if (byte >= maxAcceptedByte) {
+        continue;
+      }
+      output.push(alphabet[byte % alphabet.length]);
+      if (output.length === length) {
+        break;
+      }
+    }
+  }
+  return output.join("");
+}
+
+function generateSocksCredentials() {
+  return {
+    username: `u_${randomString(socksCredentialUsernameLength, socksCredentialUsernameAlphabet)}`,
+    password: randomString(socksCredentialPasswordLength, socksCredentialPasswordAlphabet),
+  };
+}
+
+async function copyTextToClipboard(text) {
+  const value = String(text ?? "");
+  if (!value) {
+    throw new Error("没有可复制的内容。");
+  }
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(value);
+    return;
+  }
+  if (typeof document === "undefined" || typeof document.execCommand !== "function") {
+    throw new Error("当前浏览器不支持复制到剪贴板。");
+  }
+  if (!document.body) {
+    throw new Error("当前页面暂时无法复制到剪贴板。");
+  }
+
+  const textArea = document.createElement("textarea");
+  textArea.value = value;
+  textArea.setAttribute("readonly", "");
+  textArea.style.position = "fixed";
+  textArea.style.left = "-9999px";
+  textArea.style.top = "0";
+  document.body.appendChild(textArea);
+  try {
+    textArea.select();
+    const copied = document.execCommand("copy");
+    if (!copied) {
+      throw new Error("复制到剪贴板失败。");
+    }
+  } finally {
+    document.body.removeChild(textArea);
+  }
+}
+
+function normalizeNodeSortKey(key) {
+  const normalized = String(key || "");
+  return nodeSortColumnKeys.has(normalized) ? normalized : "";
+}
+
+function normalizeNodeSortDirection(direction) {
+  return direction === "desc" ? "desc" : "asc";
+}
+
+function compareTextValue(left, right) {
+  return nodeSortCollator.compare(String(left ?? "").trim(), String(right ?? "").trim());
+}
+
+function compareNumberValue(left, right) {
+  const leftNumber = Number(left);
+  const rightNumber = Number(right);
+  const leftValid = Number.isFinite(leftNumber);
+  const rightValid = Number.isFinite(rightNumber);
+  if (leftValid && rightValid) {
+    return leftNumber - rightNumber;
+  }
+  if (leftValid) {
+    return -1;
+  }
+  if (rightValid) {
+    return 1;
+  }
+  return 0;
+}
+
+function nodeCountrySortText(node) {
+  return node?.country || node?.country_short || "";
+}
+
+function nodeProbeSortRank(node) {
+  const status = String(node?.probe_status || "not_checked").trim() || "not_checked";
+  if (status !== "not_checked" && status !== "testing" && status !== "cancelled" && status !== "unavailable") {
+    return nodeProbeStatusRank.available;
+  }
+  return nodeProbeStatusRank[status] ?? Number.MAX_SAFE_INTEGER;
+}
+
+function compareNodeProbeStatus(left, right) {
+  const rankCompare = compareNumberValue(nodeProbeSortRank(left), nodeProbeSortRank(right));
+  if (rankCompare) {
+    return rankCompare;
+  }
+  const latencyCompare = compareNumberValue(left?.probe_latency_ms, right?.probe_latency_ms);
+  if (latencyCompare) {
+    return latencyCompare;
+  }
+  return compareTextValue(formatProbeStatus(left || {}), formatProbeStatus(right || {}));
+}
+
+function compareNodeExitQuality(left, right) {
+  const fraudCompare = compareNumberValue(left?.exit_ip_info?.fraud_score, right?.exit_ip_info?.fraud_score);
+  if (fraudCompare) {
+    return fraudCompare;
+  }
+  const typeCompare = compareTextValue(
+    formatIPTypeLabel(left?.exit_ip_info?.ip_type),
+    formatIPTypeLabel(right?.exit_ip_info?.ip_type),
+  );
+  if (typeCompare) {
+    return typeCompare;
+  }
+  return compareTextValue(formatExitQualityText(left || {}), formatExitQualityText(right || {}));
+}
+
+function compareNodeNetwork(left, right) {
+  return compareTextValue(formatIPNetworkText(left?.exit_ip_info), formatIPNetworkText(right?.exit_ip_info));
+}
+
+function compareNodeBySortKey(left, right, key) {
+  switch (key) {
+    case "endpoint":
+      return (
+        compareTextValue(left?.remote_host || left?.ip, right?.remote_host || right?.ip) ||
+        compareNumberValue(left?.remote_port, right?.remote_port)
+      );
+    case "probe":
+      return compareNodeProbeStatus(left, right);
+    case "exit":
+      return compareNodeExitQuality(left, right);
+    case "network":
+      return compareNodeNetwork(left, right);
+    case "country":
+    default:
+      return compareTextValue(nodeCountrySortText(left), nodeCountrySortText(right));
+  }
+}
+
+function compareNodeFallback(left, right) {
+  return (
+    compareTextValue(nodeCountrySortText(left), nodeCountrySortText(right)) ||
+    compareTextValue(formatEndpoint(left || {}), formatEndpoint(right || {})) ||
+    compareTextValue(left?.id, right?.id)
+  );
+}
+
+function sortNodes(nodes, sort) {
+  if (!Array.isArray(nodes) || nodes.length === 0) {
+    return [];
+  }
+  const key = normalizeNodeSortKey(sort?.key);
+  if (!key) {
+    return nodes;
+  }
+  const direction = normalizeNodeSortDirection(sort?.direction);
+  const multiplier = direction === "desc" ? -1 : 1;
+  return nodes
+    .map((node, index) => ({ node, index }))
+    .sort((left, right) => {
+      const primaryCompare = compareNodeBySortKey(left.node, right.node, key);
+      if (primaryCompare) {
+        return primaryCompare * multiplier;
+      }
+      const fallbackCompare = compareNodeFallback(left.node, right.node);
+      return fallbackCompare ? fallbackCompare * multiplier : left.index - right.index;
+    })
+    .map((item) => item.node);
 }
 
 function isNodeTestAction(actionName) {
@@ -1196,6 +1422,7 @@ function NodesPage({
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(25);
   const [selectedIDs, setSelectedIDs] = useState([]);
+  const [nodeSort, setNodeSort] = useState(defaultNodeSort);
 
   const countries = useMemo(() => {
     const values = new Map();
@@ -1231,6 +1458,7 @@ function NodesPage({
         formatEndpoint(node),
         formatProbeStatus(node),
         formatExitQualityText(node),
+        formatIPNetworkText(node.exit_ip_info),
       ]
         .filter(Boolean)
         .join(" ")
@@ -1239,15 +1467,16 @@ function NodesPage({
     });
   }, [filters, nodes]);
 
-  const totalPages = Math.max(1, Math.ceil(filteredNodes.length / pageSize));
+  const sortedNodes = useMemo(() => sortNodes(filteredNodes, nodeSort), [filteredNodes, nodeSort]);
+  const totalPages = Math.max(1, Math.ceil(sortedNodes.length / pageSize));
   const safePage = Math.min(page, totalPages);
-  const pageNodes = filteredNodes.slice((safePage - 1) * pageSize, safePage * pageSize);
+  const pageNodes = sortedNodes.slice((safePage - 1) * pageSize, safePage * pageSize);
   const pageNodeIDs = pageNodes.map((node) => node.id).filter(Boolean);
   const selectedOnPage = pageNodeIDs.filter((id) => selectedIDs.includes(id));
 
   useEffect(() => {
     setPage(1);
-  }, [filters.keyword, filters.country, filters.ipType, pageSize]);
+  }, [filters.keyword, filters.country, filters.ipType, nodeSort.direction, nodeSort.key, pageSize]);
 
   useEffect(() => {
     setSelectedIDs((previous) => previous.filter((id) => nodes.some((node) => node.id === id)));
@@ -1277,6 +1506,18 @@ function NodesPage({
 
   const updateFilter = (field, value) => {
     setFilters((previous) => ({ ...previous, [field]: value }));
+  };
+
+  const updateNodeSort = (key) => {
+    const nextKey = normalizeNodeSortKey(key);
+    setNodeSort((previous) => {
+      const previousKey = normalizeNodeSortKey(previous?.key);
+      const previousDirection = normalizeNodeSortDirection(previous?.direction);
+      return {
+        key: nextKey,
+        direction: previousKey === nextKey && previousDirection === "asc" ? "desc" : "asc",
+      };
+    });
   };
 
   const toggleNode = (nodeID) => {
@@ -1354,6 +1595,7 @@ function NodesPage({
       </div>
       <NodeList
         nodes={pageNodes}
+        sort={nodeSort}
         selectedIDs={selectedIDs}
         busyAction={busyAction}
         batchTesting={batchActionActive}
@@ -1365,6 +1607,7 @@ function NodesPage({
         onCancelTest={onCancelTest}
         onConnect={onConnect}
         onDisconnect={onDisconnect}
+        onSort={updateNodeSort}
       />
       <Pagination
         page={safePage}
@@ -1534,6 +1777,75 @@ function TextInput({ label, value, onChange, type = "text", ...props }) {
     <div>
       <label>{label}</label>
       <input type={type} value={value ?? ""} onChange={(event) => onChange(event.target.value)} {...props} />
+    </div>
+  );
+}
+
+function PasswordInput({ label, value, onChange, disabled = false, ...props }) {
+  const [visible, setVisible] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const password = String(value ?? "");
+  const VisibilityIcon = visible ? EyeOff : Eye;
+  const CopyIcon = copied ? CopyCheck : Copy;
+
+  useEffect(() => {
+    setCopied(false);
+  }, [password]);
+
+  useEffect(() => {
+    if (!copied || typeof window === "undefined") {
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setCopied(false), 1400);
+    return () => window.clearTimeout(timer);
+  }, [copied]);
+
+  const copyPassword = async () => {
+    try {
+      await copyTextToClipboard(password);
+      setCopied(true);
+    } catch (error) {
+      const message = error?.message || "复制 SOCKS5 密码失败。";
+      console.error(message, error);
+      if (typeof window !== "undefined" && typeof window.alert === "function") {
+        window.alert(message);
+      }
+    }
+  };
+
+  return (
+    <div>
+      <label>{label}</label>
+      <div className="input-action-row">
+        <input
+          type={visible ? "text" : "password"}
+          value={password}
+          disabled={disabled}
+          onChange={(event) => onChange(event.target.value)}
+          {...props}
+        />
+        <button
+          type="button"
+          className="input-icon-button"
+          aria-label={visible ? "隐藏 SOCKS5 密码" : "显示 SOCKS5 密码"}
+          aria-pressed={visible}
+          disabled={disabled}
+          title={visible ? "隐藏密码" : "显示密码"}
+          onClick={() => setVisible((previous) => !previous)}
+        >
+          <VisibilityIcon size={16} aria-hidden="true" />
+        </button>
+        <button
+          type="button"
+          className="input-icon-button"
+          aria-label={copied ? "已复制 SOCKS5 密码" : "复制 SOCKS5 密码"}
+          disabled={disabled || !password}
+          title={copied ? "已复制" : "复制密码"}
+          onClick={copyPassword}
+        >
+          <CopyIcon size={16} aria-hidden="true" />
+        </button>
+      </div>
     </div>
   );
 }
@@ -1784,13 +2096,31 @@ function formatExitQualityText(node) {
   return [
     formatIPTypeLabel(info.ip_type),
     info.ip,
-    info.asn,
-    info.as_organization || info.organization,
     location,
     Number.isFinite(Number(info.fraud_score)) ? `Fraud ${info.fraud_score}` : "",
   ]
     .filter(Boolean)
     .join(" / ");
+}
+
+function formatIPASN(info) {
+  const asn = String(info?.asn || "").trim();
+  if (asn) {
+    return asn;
+  }
+  const asnNumber = Number(info?.asn_number);
+  if (!Number.isInteger(asnNumber) || asnNumber <= 0) {
+    return "";
+  }
+  return `AS${asnNumber}`;
+}
+
+function formatIPNetworkText(info) {
+  if (!info) {
+    return "";
+  }
+  const provider = String(info.as_organization || info.organization || info.isp || "").trim();
+  return [formatIPASN(info), provider].filter(Boolean).join(" / ");
 }
 
 function NodeList({
@@ -1806,6 +2136,8 @@ function NodeList({
   onCancelTest,
   onConnect,
   onDisconnect,
+  onSort,
+  sort,
 }) {
   const defaultListenerKey = listenerOptions[0]?.key || "";
   const [selectedListeners, setSelectedListeners] = useState({});
@@ -1836,12 +2168,11 @@ function NodeList({
   }
   return (
     <div className="list-scroll">
-      <div className="node-row node-head" aria-hidden="true">
-        <span></span>
-        <span>国家</span>
-        <span>节点地址</span>
-        <span>状态</span>
-        <span>真实出口测试</span>
+      <div className="node-row node-head">
+        <span aria-hidden="true"></span>
+        {nodeSortColumns.map((column) => (
+          <SortableNodeHeader key={column.key} column={column} sort={sort} onSort={onSort} />
+        ))}
         <span>绑定入口</span>
         <span>操作</span>
       </div>
@@ -1890,6 +2221,7 @@ function NodeList({
             <div className="node-cell mono">{formatEndpoint(node)}</div>
             <div className="node-cell muted">{formatProbeStatus(node)}</div>
             <ExitTestInfo node={node} />
+            <NodeNetworkInfo node={node} />
             <select
               className="node-listener-select"
               value={selectedListener}
@@ -1916,6 +2248,34 @@ function NodeList({
         );
       })}
     </div>
+  );
+}
+
+function SortableNodeHeader({ column, sort, onSort }) {
+  const sortKey = normalizeNodeSortKey(sort?.key);
+  const direction = normalizeNodeSortDirection(sort?.direction);
+  const active = sortKey === column.key;
+  const nextDirection = active && direction === "asc" ? "desc" : "asc";
+  const currentText = active ? `当前${nodeSortDirectionLabels[direction]}` : "当前未排序";
+  const sortable = typeof onSort === "function";
+
+  return (
+    <button
+      type="button"
+      className={`node-sort-button ${active ? "active" : ""}`}
+      aria-label={`${column.label}，${currentText}，点击${nodeSortDirectionLabels[nextDirection]}排序`}
+      aria-pressed={active}
+      disabled={!sortable}
+      title={`按${column.label}${nodeSortDirectionLabels[nextDirection]}排序`}
+      onClick={() => {
+        if (sortable) {
+          onSort(column.key);
+        }
+      }}
+    >
+      <span>{column.label}</span>
+      <ArrowUpDown className={`sort-icon ${active ? direction : ""}`} size={14} aria-hidden="true" />
+    </button>
   );
 }
 
@@ -1961,6 +2321,15 @@ function ExitTestInfo({ node }) {
   return (
     <div className="node-exit-test" title={quality}>
       <span className="node-quality">{quality}</span>
+    </div>
+  );
+}
+
+function NodeNetworkInfo({ node }) {
+  const network = formatIPNetworkText(node?.exit_ip_info);
+  return (
+    <div className="node-cell node-network" title={network || "无 ASN / 运营商信息"}>
+      {network || "-"}
     </div>
   );
 }
@@ -2015,11 +2384,27 @@ function ListenerEditor({ listeners, onUpdate, onRemove }) {
     <div className="listener-list">
       {listeners.map((listener, index) => {
         const backendPolicyEnabled = listener.backend_policy_enabled === true;
+        const generateListenerCredentials = () => {
+          try {
+            const credentials = generateSocksCredentials();
+            onUpdate(index, "username", credentials.username);
+            onUpdate(index, "password", credentials.password);
+          } catch (error) {
+            const message = error?.message || "生成 SOCKS5 随机用户名和密码失败。";
+            console.error(message, error);
+            if (typeof window !== "undefined" && typeof window.alert === "function") {
+              window.alert(message);
+            }
+          }
+        };
         return (
           <div className="listener" key={`${listener.name}-${index}`}>
             <div className="listener-head">
               <strong>{listener.name || `socks${index + 1}`}</strong>
-              <ActionButton icon={Trash2} label="删除" danger compact onClick={() => onRemove(index)} />
+              <div className="listener-head-actions">
+                <ActionButton icon={Dices} label="随机账号密码" compact onClick={generateListenerCredentials} />
+                <ActionButton icon={Trash2} label="删除" danger compact onClick={() => onRemove(index)} />
+              </div>
             </div>
             <div className="form-grid">
               <TextInput label="名称" value={listener.name} onChange={(value) => onUpdate(index, "name", value)} />
@@ -2035,7 +2420,7 @@ function ListenerEditor({ listeners, onUpdate, onRemove }) {
               <TextInput label="监听地址" value={listener.host} onChange={(value) => onUpdate(index, "host", value)} />
               <TextInput label="监听端口" type="number" min="1024" max="65535" value={listener.port} onChange={(value) => onUpdate(index, "port", value)} />
               <TextInput label="SOCKS5 用户名" value={listener.username} onChange={(value) => onUpdate(index, "username", value)} autoComplete="off" placeholder="留空则无鉴权" />
-              <TextInput label="SOCKS5 密码" type="password" value={listener.password} onChange={(value) => onUpdate(index, "password", value)} autoComplete="new-password" placeholder="公网监听必须填写" />
+              <PasswordInput label="SOCKS5 密码" value={listener.password} onChange={(value) => onUpdate(index, "password", value)} autoComplete="new-password" placeholder="公网监听必须填写" />
               <SelectInput
                 label="绑定策略"
                 value={String(backendPolicyEnabled)}
