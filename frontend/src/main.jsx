@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
@@ -1473,6 +1473,15 @@ function NodesPage({
   const pageNodes = sortedNodes.slice((safePage - 1) * pageSize, safePage * pageSize);
   const pageNodeIDs = pageNodes.map((node) => node.id).filter(Boolean);
   const selectedOnPage = pageNodeIDs.filter((id) => selectedIDs.includes(id));
+  const nodeListScrollResetKey = JSON.stringify([
+    filters.keyword,
+    filters.country,
+    filters.ipType,
+    nodeSort.key,
+    nodeSort.direction,
+    safePage,
+    pageSize,
+  ]);
 
   useEffect(() => {
     setPage(1);
@@ -1596,6 +1605,7 @@ function NodesPage({
       <NodeList
         nodes={pageNodes}
         sort={nodeSort}
+        scrollResetKey={nodeListScrollResetKey}
         selectedIDs={selectedIDs}
         busyAction={busyAction}
         batchTesting={batchActionActive}
@@ -2138,9 +2148,41 @@ function NodeList({
   onDisconnect,
   onSort,
   sort,
+  scrollResetKey = "",
 }) {
   const defaultListenerKey = listenerOptions[0]?.key || "";
   const [selectedListeners, setSelectedListeners] = useState({});
+  const listScrollRef = useRef(null);
+  const listScrollPositionRef = useRef({ top: 0, left: 0 });
+  const previousScrollResetKeyRef = useRef(scrollResetKey);
+
+  const handleListScroll = useCallback((event) => {
+    const target = event.currentTarget;
+    listScrollPositionRef.current = {
+      top: target.scrollTop,
+      left: target.scrollLeft,
+    };
+  }, [scrollResetKey]);
+
+  useLayoutEffect(() => {
+    const list = listScrollRef.current;
+    const resetKeyChanged = previousScrollResetKeyRef.current !== scrollResetKey;
+    previousScrollResetKeyRef.current = scrollResetKey;
+    if (!list) {
+      return;
+    }
+    if (resetKeyChanged) {
+      listScrollPositionRef.current = { top: 0, left: 0 };
+      list.scrollTop = 0;
+      list.scrollLeft = 0;
+      return;
+    }
+    const position = listScrollPositionRef.current;
+    const maxTop = Math.max(0, list.scrollHeight - list.clientHeight);
+    const maxLeft = Math.max(0, list.scrollWidth - list.clientWidth);
+    list.scrollTop = Math.min(position.top, maxTop);
+    list.scrollLeft = Math.min(position.left, maxLeft);
+  });
 
   useEffect(() => {
     setSelectedListeners((previous) => {
@@ -2167,7 +2209,7 @@ function NodeList({
     return <div className="readout">暂无匹配节点。</div>;
   }
   return (
-    <div className="list-scroll">
+    <div className="list-scroll" ref={listScrollRef} onScroll={handleListScroll}>
       <div className="node-row node-head">
         <span aria-hidden="true"></span>
         {nodeSortColumns.map((column) => (
