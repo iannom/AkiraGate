@@ -1410,6 +1410,203 @@ func TestSelectListenerNodeIDsPrefersListenerFixedNode(t *testing.T) {
 	}
 }
 
+func TestProxyAllocateRequiresAPIToken(t *testing.T) {
+	server := testServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/secret/api/proxy/allocate", bytes.NewReader([]byte(`{"country_code":"JP"}`)))
+	rec := httptest.NewRecorder()
+
+	server.route(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("未配置 API Token 时应拒绝机器接口，实际: %d", rec.Code)
+	}
+}
+
+func TestProxyAllocateCreatesDynamicSocksEntryAndSkipsRecentExitIP(t *testing.T) {
+	server, token, closed := testProxyAPIServer(t)
+	now := time.Now()
+	server.nodes = []vpngate.Node{
+		proxyTestNode("jp-1", "JP", "198.51.100.10"),
+		proxyTestNode("jp-2", "JP", "198.51.100.11"),
+	}
+	server.proxyCache = map[string]proxyCacheEntry{
+		"jp-1": proxyTestCache("jp-1", "JP", "198.51.100.10", now.Add(time.Hour)),
+		"jp-2": proxyTestCache("jp-2", "JP", "198.51.100.11", now.Add(time.Hour)),
+	}
+
+	first := proxyAllocateRequest(t, server, token, "JP")
+	if first.Code != http.StatusOK {
+		t.Fatalf("首次分配应成功: %d %s", first.Code, first.Body.String())
+	}
+	var firstPayload ProxyAllocateResponse
+	if err := json.Unmarshal(first.Body.Bytes(), &firstPayload); err != nil {
+		t.Fatalf("首次分配响应不是有效 JSON: %v", err)
+	}
+	if firstPayload.NodeID != "jp-1" || firstPayload.ExitIP != "198.51.100.10" {
+		t.Fatalf("首次分配应返回第一个家宽节点，实际: %+v", firstPayload)
+	}
+	if firstPayload.Host != "203.0.113.200" || firstPayload.Port != 19080 {
+		t.Fatalf("动态入口应返回外部可连接地址，实际: %+v", firstPayload)
+	}
+	if firstPayload.Username == "" || firstPayload.Password == "" || !strings.Contains(firstPayload.ProxyURL, "@203.0.113.200:19080") {
+		t.Fatalf("动态入口应返回带鉴权 SOCKS5 信息，实际: %+v", firstPayload)
+	}
+
+	second := proxyAllocateRequest(t, server, token, "JP")
+	if second.Code != http.StatusOK {
+		t.Fatalf("第二次分配应跳过一小时内已返回的出口 IP: %d %s", second.Code, second.Body.String())
+	}
+	var secondPayload ProxyAllocateResponse
+	if err := json.Unmarshal(second.Body.Bytes(), &secondPayload); err != nil {
+		t.Fatalf("第二次分配响应不是有效 JSON: %v", err)
+	}
+	if secondPayload.NodeID != "jp-2" || secondPayload.ExitIP != "198.51.100.11" {
+		t.Fatalf("第二次分配应返回不同出口 IP，实际: %+v", secondPayload)
+	}
+
+	release := proxyReleaseRequest(t, server, token, firstPayload.AllocationID)
+	if release.Code != http.StatusOK {
+		t.Fatalf("释放动态入口失败: %d %s", release.Code, release.Body.String())
+	}
+	if *closed != 1 {
+		t.Fatalf("释放 API 应关闭对应动态入口，实际关闭次数: %d", *closed)
+	}
+}
+
+func TestProxyAllocateFiltersResidentialAndCacheTTL(t *testing.T) {
+	server, token, _ := testProxyAPIServer(t)
+	now := time.Now()
+	server.nodes = []vpngate.Node{
+		proxyTestNode("jp-dc", "JP", "198.51.100.20"),
+		proxyTestNode("jp-expired", "JP", "198.51.100.21"),
+		proxyTestNode("jp-home", "JP", "198.51.100.22"),
+	}
+	server.proxyCache = map[string]proxyCacheEntry{
+		"jp-dc":      {NodeID: "jp-dc", CountryCode: "JP", ExitIP: "198.51.100.20", IPType: "datacenter", Available: true, UpdatedAt: now, ExpiresAt: now.Add(time.Hour)},
+		"jp-expired": proxyTestCache("jp-expired", "JP", "198.51.100.21", now.Add(-time.Second)),
+		"jp-home":    proxyTestCache("jp-home", "JP", "198.51.100.22", now.Add(time.Hour)),
+	}
+
+	rec := proxyAllocateRequest(t, server, token, "JP")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应选择未过期的家宽缓存节点: %d %s", rec.Code, rec.Body.String())
+	}
+	var payload ProxyAllocateResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("分配响应不是有效 JSON: %v", err)
+	}
+	if payload.NodeID != "jp-home" {
+		t.Fatalf("应过滤数据中心和过期缓存，实际: %+v", payload)
+	}
+}
+
+func TestReleaseProxyIsIdempotent(t *testing.T) {
+	server, token, _ := testProxyAPIServer(t)
+	rec := proxyReleaseRequest(t, server, token, "missing")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("释放不存在动态入口也应幂等成功: %d %s", rec.Code, rec.Body.String())
+	}
+	var payload ProxyReleaseResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("释放响应不是有效 JSON: %v", err)
+	}
+	if payload.Released {
+		t.Fatalf("不存在的动态入口不应标记为已释放: %+v", payload)
+	}
+}
+
+func TestReleaseProxyKeepsAllocationWhenCloseFails(t *testing.T) {
+	server := testServer(t)
+	closeErr := errors.New("close failed")
+	server.dynamicProxies["lease-1"] = dynamicProxyAllocation{
+		ID:        "lease-1",
+		ExpiresAt: time.Now().Add(time.Hour),
+		Handle: dynamicProxyHandle{close: func() error {
+			return closeErr
+		}},
+	}
+
+	released, err := server.releaseProxyAllocation("lease-1")
+
+	if !released || err == nil {
+		t.Fatalf("关闭失败时应返回释放失败: released=%t err=%v", released, err)
+	}
+	if _, ok := server.dynamicProxies["lease-1"]; !ok {
+		t.Fatal("关闭失败时应保留分配记录，允许后续重试释放")
+	}
+	if len(server.releasingProxies) != 0 {
+		t.Fatalf("关闭失败后应清理释放中标记: %+v", server.releasingProxies)
+	}
+}
+
+func TestCleanupExpiredProxyAllocationsClosesHandles(t *testing.T) {
+	server := testServer(t)
+	closed := 0
+	server.dynamicProxies["lease-1"] = dynamicProxyAllocation{
+		ID:        "lease-1",
+		ExpiresAt: time.Now().Add(-time.Second),
+		Handle: dynamicProxyHandle{close: func() error {
+			closed++
+			return nil
+		}},
+	}
+
+	server.cleanupExpiredProxyAllocations(time.Now())
+
+	if closed != 1 {
+		t.Fatalf("过期动态入口应自动关闭，实际关闭次数: %d", closed)
+	}
+	if len(server.dynamicProxies) != 0 {
+		t.Fatalf("过期动态入口应从状态中清理: %+v", server.dynamicProxies)
+	}
+}
+
+func TestCleanupExpiredProxyAllocationsKeepsFailedClose(t *testing.T) {
+	server := testServer(t)
+	server.dynamicProxies["lease-1"] = dynamicProxyAllocation{
+		ID:        "lease-1",
+		ExpiresAt: time.Now().Add(-time.Second),
+		Handle: dynamicProxyHandle{close: func() error {
+			return errors.New("close failed")
+		}},
+	}
+
+	server.cleanupExpiredProxyAllocations(time.Now())
+
+	if _, ok := server.dynamicProxies["lease-1"]; !ok {
+		t.Fatal("自动释放失败时应保留分配记录，等待下次重试")
+	}
+}
+
+func TestMergeRetainedNodesKeepsAllocatedAndCachedNodes(t *testing.T) {
+	server := testServer(t)
+	now := time.Now()
+	server.nodes = []vpngate.Node{
+		{ID: "cached", CountryShort: "JP"},
+		{ID: "allocated", CountryShort: "US"},
+		{ID: "stale", CountryShort: "TH"},
+	}
+	server.proxyCache["cached"] = proxyCacheEntry{NodeID: "cached", ExpiresAt: now.Add(time.Hour)}
+	server.dynamicProxies["lease"] = dynamicProxyAllocation{ID: "lease", NodeID: "allocated", ExpiresAt: now.Add(time.Hour)}
+
+	merged := server.mergeRetainedNodesLocked([]vpngate.Node{{ID: "fresh", CountryShort: "RO"}}, now)
+
+	ids := map[string]struct{}{}
+	for _, node := range merged {
+		ids[node.ID] = struct{}{}
+	}
+	for _, expected := range []string{"fresh", "cached", "allocated"} {
+		if _, ok := ids[expected]; !ok {
+			t.Fatalf("刷新节点后应保留 %s，实际: %+v", expected, merged)
+		}
+	}
+	if _, ok := ids["stale"]; ok {
+		t.Fatalf("无活跃、无分配、缓存过期外的旧节点不应保留: %+v", merged)
+	}
+}
+
 func testServer(t *testing.T) *Server {
 	t.Helper()
 	return NewServer(filepath.Join(t.TempDir(), "config.json"), testConfig(), nil)
@@ -1426,10 +1623,97 @@ func testConfig() Config {
 		SecretPath:        "secret",
 		AdminUsername:     "admin",
 		AdminPasswordHash: adminPasswordHash,
+		ProxyCacheTTL:     3600,
+		ProxyLeaseSeconds: 3600,
+		ProxyListenHost:   "0.0.0.0",
+		RefreshSeconds:    960,
+		RoutingMode:       "auto",
 		SocksListeners: []gatewayconfig.Listener{
 			gatewayconfig.NewListener("local", "127.0.0.1", 7928, true),
 		},
 	}
+}
+
+func testProxyAPIServer(t *testing.T) (*Server, string, *int) {
+	t.Helper()
+	config := testConfig()
+	token := "machine-token"
+	hash, err := HashAPIToken(token)
+	if err != nil {
+		t.Fatalf("生成 API Token 哈希失败: %v", err)
+	}
+	config.APITokenHash = hash
+	server := NewServer(filepath.Join(t.TempDir(), "config.json"), config, nil)
+	closed := 0
+	server.startDynamicProxy = func(_ context.Context, options dynamicProxyStartOptions) (dynamicProxyHandle, error) {
+		if options.Listener.Username == "" || options.Listener.Password == "" {
+			return dynamicProxyHandle{}, errors.New("动态 SOCKS5 入口必须启用鉴权")
+		}
+		return dynamicProxyHandle{
+			ProxyAddress: "0.0.0.0:19080",
+			close: func() error {
+				closed++
+				return nil
+			},
+		}, nil
+	}
+	return server, token, &closed
+}
+
+func proxyTestNode(id string, countryCode string, exitIP string) vpngate.Node {
+	return vpngate.Node{
+		ID:           id,
+		CountryShort: countryCode,
+		IP:           "203.0.113.10",
+		RemoteHost:   "203.0.113.10",
+		ConfigText:   "client\nremote 203.0.113.10 1194 udp\n",
+		ProbeStatus:  "available",
+		ProbeLatency: 120,
+		ExitIPInfo: &vpngate.IPInfo{
+			IP:          exitIP,
+			CountryCode: countryCode,
+			IPType:      "broadband",
+			Residential: true,
+		},
+	}
+}
+
+func proxyTestCache(nodeID string, countryCode string, exitIP string, expiresAt time.Time) proxyCacheEntry {
+	return proxyCacheEntry{
+		NodeID:      nodeID,
+		CountryCode: countryCode,
+		EntryIP:     "203.0.113.10",
+		ExitIP:      exitIP,
+		IPType:      "broadband",
+		Residential: true,
+		Available:   true,
+		LatencyMS:   120,
+		UpdatedAt:   time.Now(),
+		ExpiresAt:   expiresAt,
+	}
+}
+
+func proxyAllocateRequest(t *testing.T, server *Server, token string, countryCode string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/secret/api/proxy/allocate", bytes.NewReader([]byte(fmt.Sprintf(`{"country_code":"%s"}`, countryCode))))
+	req.Host = "203.0.113.200:8787"
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	server.route(rec, req)
+	return rec
+}
+
+func proxyReleaseRequest(t *testing.T, server *Server, token string, allocationID string) *httptest.ResponseRecorder {
+	t.Helper()
+	body, err := json.Marshal(ProxyReleaseRequest{AllocationID: allocationID})
+	if err != nil {
+		t.Fatalf("构造释放请求失败: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/secret/api/proxy/release", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	server.route(rec, req)
+	return rec
 }
 
 func boolPtr(value bool) *bool {

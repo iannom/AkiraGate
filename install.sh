@@ -11,6 +11,7 @@ INSTALL_DIR="${INSTALL_DIR:-/opt/akiragate}"
 DATA_DIR="${AKIRAGATE_DATA_DIR:-${INSTALL_DIR}/akiragate_data}"
 CONFIG_FILE="${AKIRAGATE_CONFIG:-${DATA_DIR}/config.json}"
 GENERATED_ADMIN_PASSWORD=""
+GENERATED_API_TOKEN=""
 REQUIRED_GO_VERSION="1.23.1"
 GO_INSTALL_VERSION="${GO_INSTALL_VERSION:-1.23.10}"
 REQUIRED_NODE_VERSION="20.19.0"
@@ -234,6 +235,7 @@ build_frontend() {
 ensure_config() {
     mkdir -p "$DATA_DIR"
     if [ -f "$CONFIG_FILE" ] && grep -q '"socks5_listeners"' "$CONFIG_FILE"; then
+        ensure_existing_config_api_token
         return
     fi
     if [ -f "$CONFIG_FILE" ]; then
@@ -244,6 +246,8 @@ ensure_config() {
     username="admin"
     password="$(random_token 16)"
     GENERATED_ADMIN_PASSWORD="$password"
+    api_token="$(random_token 32)"
+    GENERATED_API_TOKEN="$api_token"
     suffix="$(random_token 12)"
     proxy_password="$(random_token 16)"
     cat > "$CONFIG_FILE" <<EOF
@@ -253,10 +257,14 @@ ensure_config() {
   "secret_path": "${suffix}",
   "admin_username": "${username}",
   "admin_password": "${password}",
+  "api_token": "${api_token}",
   "openvpn_config": "",
   "openvpn_auth": "${DATA_DIR}/vpngate_auth.txt",
   "auto_connect": false,
   "refresh_seconds": 960,
+  "proxy_cache_ttl_seconds": 3600,
+  "proxy_lease_seconds": 3600,
+  "proxy_listen_host": "0.0.0.0",
   "routing_mode": "auto",
   "force_country": "",
   "fixed_node_id": "",
@@ -277,6 +285,61 @@ EOF
         printf "vpn\nvpn\n" > "${DATA_DIR}/vpngate_auth.txt"
         chmod 600 "${DATA_DIR}/vpngate_auth.txt"
     fi
+}
+
+ensure_existing_config_api_token() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        return
+    fi
+    if grep -q '"api_token_hash"' "$CONFIG_FILE" || grep -q '"api_token"' "$CONFIG_FILE"; then
+        return
+    fi
+    node_bin="$(command -v node || true)"
+    if [ -z "$node_bin" ] && [ -x /usr/local/bin/node ]; then
+        node_bin="/usr/local/bin/node"
+    fi
+    if [ -z "$node_bin" ] && [ -x /usr/local/node/bin/node ]; then
+        node_bin="/usr/local/node/bin/node"
+    fi
+    if [ -z "$node_bin" ]; then
+        echo -e "${YELLOW}找不到 node，无法为现有配置自动补齐机器 API Token。${PLAIN}"
+        return
+    fi
+    api_token="$(random_token 32)"
+    backup="${CONFIG_FILE}.api-token.$(date +%Y%m%d%H%M%S)"
+    cp -p "$CONFIG_FILE" "$backup"
+    export CONFIG_FILE AKIRAGATE_NEW_API_TOKEN="$api_token"
+    if "$node_bin" <<'NODE'
+const fs = require("fs");
+const path = process.env.CONFIG_FILE;
+const token = process.env.AKIRAGATE_NEW_API_TOKEN;
+const raw = fs.readFileSync(path, "utf8");
+const config = JSON.parse(raw);
+if (!config.api_token && !config.api_token_hash) {
+  config.api_token = token;
+}
+if (!config.proxy_cache_ttl_seconds) {
+  config.proxy_cache_ttl_seconds = 3600;
+}
+if (!config.proxy_lease_seconds) {
+  config.proxy_lease_seconds = 3600;
+}
+if (!config.proxy_listen_host) {
+  config.proxy_listen_host = "0.0.0.0";
+}
+const tempPath = `${path}.tmp.${process.pid}`;
+fs.writeFileSync(tempPath, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+fs.renameSync(tempPath, path);
+NODE
+    then
+        chmod 600 "$CONFIG_FILE"
+        GENERATED_API_TOKEN="$api_token"
+        echo -e "${GREEN}已为现有配置生成机器 API Token，配置备份: ${backup}${PLAIN}"
+    else
+        cp -p "$backup" "$CONFIG_FILE"
+        echo -e "${YELLOW}现有配置补齐机器 API Token 失败，已恢复备份: ${backup}${PLAIN}"
+    fi
+    unset AKIRAGATE_NEW_API_TOKEN
 }
 
 configure_service() {
@@ -347,8 +410,12 @@ status_cmd() {
     secret_path="$(json_value secret_path)"
     admin_username="$(json_value admin_username)"
     admin_password="$(json_value admin_password)"
+    api_token="$(json_value api_token)"
     if [ -z "$admin_password" ]; then
         admin_password="配置已使用哈希保存，请使用安装时记录的密码或在 Web 管理端修改。"
+    fi
+    if [ -z "$api_token" ]; then
+        api_token="配置已使用哈希保存，请使用安装时记录的 API Token。"
     fi
     echo "======================================================="
     echo "             AkiraGate Go 管理终端"
@@ -356,6 +423,7 @@ status_cmd() {
     echo "网页登录地址: http://<服务器IP>:${web_port:-8787}/${secret_path}/"
     echo "管理账号: ${admin_username}"
     echo "管理密码: ${admin_password}"
+    echo "机器 API Token: ${api_token}"
     echo "SOCKS5 监听请在 Web 管理端查看和配置。"
 }
 
@@ -552,8 +620,12 @@ print_summary() {
     secret_path="$(json_value secret_path)"
     admin_username="$(json_value admin_username)"
     admin_password="${GENERATED_ADMIN_PASSWORD:-$(json_value admin_password)}"
+    api_token="${GENERATED_API_TOKEN:-$(json_value api_token)}"
     if [ -z "$admin_password" ]; then
         admin_password="配置已使用哈希保存，请使用安装时记录的密码或在 Web 管理端修改。"
+    fi
+    if [ -z "$api_token" ]; then
+        api_token="配置已使用哈希保存，请使用安装时记录的 API Token。"
     fi
 
     echo
@@ -563,6 +635,7 @@ print_summary() {
     echo "  * 网页控制面板: http://${public_ip}:${web_port:-8787}/${secret_path}/"
     echo "  * 网页管理账号: ${admin_username:-admin}"
     echo "  * 网页管理密码: ${admin_password}"
+    echo "  * 机器 API Token: ${api_token}"
     echo "  * SOCKS5 监听:"
     print_socks_listeners
     echo "  * 快速状态指令: ml status"

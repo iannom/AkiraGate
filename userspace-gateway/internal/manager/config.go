@@ -22,10 +22,15 @@ type Config struct {
 	AdminUsername     string                   `json:"admin_username"`
 	AdminPassword     string                   `json:"admin_password,omitempty"`
 	AdminPasswordHash string                   `json:"admin_password_hash"`
+	APIToken          string                   `json:"api_token,omitempty"`
+	APITokenHash      string                   `json:"api_token_hash,omitempty"`
 	OpenVPNConfig     string                   `json:"openvpn_config"`
 	OpenVPNAuth       string                   `json:"openvpn_auth"`
 	AutoConnect       bool                     `json:"auto_connect"`
 	RefreshSeconds    int                      `json:"refresh_seconds"`
+	ProxyCacheTTL     int                      `json:"proxy_cache_ttl_seconds,omitempty"`
+	ProxyLeaseSeconds int                      `json:"proxy_lease_seconds,omitempty"`
+	ProxyListenHost   string                   `json:"proxy_listen_host,omitempty"`
 	RoutingMode       string                   `json:"routing_mode"`
 	ForceCountry      string                   `json:"force_country"`
 	FixedNodeID       string                   `json:"fixed_node_id"`
@@ -46,6 +51,9 @@ func DefaultConfig() Config {
 		AdminPasswordHash: adminPasswordHash,
 		AutoConnect:       false,
 		RefreshSeconds:    960,
+		ProxyCacheTTL:     3600,
+		ProxyLeaseSeconds: 3600,
+		ProxyListenHost:   "0.0.0.0",
 		RoutingMode:       "auto",
 		SocksListeners: []gatewayconfig.Listener{
 			withListenerAuth(gatewayconfig.NewListener("local", "127.0.0.1", 7928, true), "proxy", proxyPassword),
@@ -74,6 +82,7 @@ func LoadConfig(path string) (Config, error) {
 	}
 	needsMigration := strings.TrimSpace(config.AdminPassword) != "" ||
 		strings.TrimSpace(config.AdminPasswordHash) == "" ||
+		strings.TrimSpace(config.APIToken) != "" ||
 		(config.AutoConnect && strings.TrimSpace(config.OpenVPNConfig) == "" && !hasListenerBackendPolicy(config.SocksListeners))
 	normalizeConfig(&config)
 	if err := ValidateConfig(config); err != nil {
@@ -120,6 +129,18 @@ func ValidateConfig(config Config) error {
 	}
 	if !validPasswordHash(config.AdminPasswordHash) {
 		return errors.New("管理密码哈希无效")
+	}
+	if config.APITokenHash != "" && !validPasswordHash(config.APITokenHash) {
+		return errors.New("API Token 哈希无效")
+	}
+	if config.ProxyCacheTTL < 60 {
+		return errors.New("代理质量缓存 TTL 不能小于 60 秒")
+	}
+	if config.ProxyLeaseSeconds < 60 {
+		return errors.New("动态代理入口租约不能小于 60 秒")
+	}
+	if strings.TrimSpace(config.ProxyListenHost) == "" {
+		return errors.New("动态代理入口监听地址不能为空")
 	}
 	if err := validateRouting(config); err != nil {
 		return err
@@ -189,8 +210,11 @@ func normalizeConfig(config *Config) {
 	config.AdminUsername = strings.TrimSpace(config.AdminUsername)
 	config.AdminPassword = strings.TrimSpace(config.AdminPassword)
 	config.AdminPasswordHash = strings.TrimSpace(config.AdminPasswordHash)
+	config.APIToken = strings.TrimSpace(config.APIToken)
+	config.APITokenHash = strings.TrimSpace(config.APITokenHash)
 	config.OpenVPNConfig = strings.TrimSpace(config.OpenVPNConfig)
 	config.OpenVPNAuth = strings.TrimSpace(config.OpenVPNAuth)
+	config.ProxyListenHost = strings.TrimSpace(config.ProxyListenHost)
 	config.RoutingMode = strings.TrimSpace(config.RoutingMode)
 	config.ForceCountry = strings.ToUpper(strings.TrimSpace(config.ForceCountry))
 	config.FixedNodeID = strings.TrimSpace(config.FixedNodeID)
@@ -213,6 +237,13 @@ func normalizeConfig(config *Config) {
 		}
 	}
 	config.AdminPassword = ""
+	if config.APITokenHash == "" && config.APIToken != "" {
+		hash, err := HashAPIToken(config.APIToken)
+		if err == nil {
+			config.APITokenHash = hash
+		}
+	}
+	config.APIToken = ""
 	if config.AdminPasswordHash == "" {
 		hash, err := HashPassword(randomHex(9))
 		if err == nil {
@@ -221,6 +252,15 @@ func normalizeConfig(config *Config) {
 	}
 	if config.RefreshSeconds <= 0 {
 		config.RefreshSeconds = 960
+	}
+	if config.ProxyCacheTTL <= 0 {
+		config.ProxyCacheTTL = 3600
+	}
+	if config.ProxyLeaseSeconds <= 0 {
+		config.ProxyLeaseSeconds = 3600
+	}
+	if config.ProxyListenHost == "" {
+		config.ProxyListenHost = "0.0.0.0"
 	}
 	if config.RoutingMode == "" {
 		config.RoutingMode = "auto"
@@ -284,11 +324,19 @@ func normalizeCIDRs(values []string) []string {
 }
 
 func HashPassword(password string) (string, error) {
-	password = strings.TrimSpace(password)
-	if password == "" {
-		return "", errors.New("管理密码不能为空")
+	return hashSecret(password, "管理密码")
+}
+
+func HashAPIToken(token string) (string, error) {
+	return hashSecret(token, "API Token")
+}
+
+func hashSecret(value string, fieldName string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", fmt.Errorf("%s不能为空", fieldName)
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
+	hash, err := bcrypt.GenerateFromPassword([]byte(value), bcrypt.DefaultCost)
 	if err != nil {
 		return "", err
 	}
@@ -304,10 +352,18 @@ func validPasswordHash(hash string) bool {
 }
 
 func verifyPassword(hash string, password string) bool {
-	if hash == "" || password == "" {
+	return verifySecret(hash, password)
+}
+
+func verifyAPIToken(hash string, token string) bool {
+	return verifySecret(hash, token)
+}
+
+func verifySecret(hash string, value string) bool {
+	if hash == "" || value == "" {
 		return false
 	}
-	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) == nil
+	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(value)) == nil
 }
 
 func randomHex(size int) string {

@@ -11,6 +11,7 @@ LISTEN_HOST="${AKIRAGATE_DEV_LISTEN_HOST:-0.0.0.0}"
 SECRET_PATH="${AKIRAGATE_DEV_SECRET_PATH:-dev}"
 ADMIN_USERNAME="${AKIRAGATE_DEV_ADMIN_USERNAME:-admin}"
 ADMIN_PASSWORD="${AKIRAGATE_DEV_ADMIN_PASSWORD:-password}"
+API_TOKEN="${AKIRAGATE_DEV_API_TOKEN:-dev-api-token}"
 SOCKS_USERNAME="${AKIRAGATE_DEV_SOCKS_USERNAME:-proxy}"
 SOCKS_PASSWORD="${AKIRAGATE_DEV_SOCKS_PASSWORD:-password}"
 
@@ -86,10 +87,14 @@ write_default_config() {
   "secret_path": "${SECRET_PATH}",
   "admin_username": "${ADMIN_USERNAME}",
   "admin_password": "${ADMIN_PASSWORD}",
+  "api_token": "${API_TOKEN}",
   "openvpn_config": "",
   "openvpn_auth": "${DEV_DIR}/vpngate_auth.txt",
   "auto_connect": false,
   "refresh_seconds": 960,
+  "proxy_cache_ttl_seconds": 3600,
+  "proxy_lease_seconds": 3600,
+  "proxy_listen_host": "0.0.0.0",
   "routing_mode": "auto",
   "force_country": "",
   "fixed_node_id": "",
@@ -174,6 +179,8 @@ config_secret_path="$(read_json_string secret_path)"
 config_admin_username="$(read_json_string admin_username)"
 config_admin_password="$(read_json_string admin_password)"
 config_admin_password_hash="$(read_json_string admin_password_hash)"
+config_api_token="$(read_json_string api_token)"
+config_api_token_hash="$(read_json_string api_token_hash)"
 
 if [ "${config_web_port:-}" != "$WEB_PORT" ]; then
     echo "提示: 已存在 ${CONFIG_FILE}，使用配置内 Web 端口 ${config_web_port:-未知}。"
@@ -189,6 +196,11 @@ if [ -n "${config_admin_password:-}" ]; then
     ADMIN_PASSWORD="$config_admin_password"
 elif [ -n "${config_admin_password_hash:-}" ]; then
     ADMIN_PASSWORD="配置已使用哈希保存，请使用你上次设置的管理密码。"
+fi
+if [ -n "${config_api_token:-}" ]; then
+    API_TOKEN="$config_api_token"
+elif [ -n "${config_api_token_hash:-}" ]; then
+    API_TOKEN="配置已使用哈希保存，请使用你上次记录的 API Token。"
 fi
 
 if ! port_available "$WEB_PORT"; then
@@ -210,6 +222,7 @@ AkiraGate 本地开发环境已启动
 后端管理地址: ${backend_origin}/${SECRET_PATH}/
 管理账号: ${ADMIN_USERNAME}
 管理密码: ${ADMIN_PASSWORD}
+机器 API Token: ${API_TOKEN}
 SOCKS5 默认端口: ${SOCKS_PORT}
 
 按 Ctrl+C 停止前后端进程。
