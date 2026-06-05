@@ -19,6 +19,33 @@ bash <(curl -Ls https://raw.githubusercontent.com/iannom/AkiraGate/main/install.
 
 终端会输出 Web 管理地址、管理账号和初始密码。管理端使用应用内登录会话，后端 API 会校验登录 Cookie。
 
+## Docker Compose 部署
+
+本仓库提供 `Dockerfile` 和 `compose.yaml`，镜像会先构建 React/Vite 前端，再构建 Go 后端，运行时只启动 `akiragate-server` 并托管静态前端。
+
+```bash
+docker compose up -d --build
+docker compose logs akiragate
+```
+
+首次启动时，容器入口脚本会在 `/data/config.json` 不存在时生成配置，并在日志中输出 Web 管理地址、管理账号、管理密码、机器 API Token 和默认 SOCKS5 密码。配置会保存在 `akiragate-data` Docker 卷中；后端启动后会把明文密码和 Token 迁移为 bcrypt 哈希。
+
+默认端口：
+
+- Web 管理端：宿主机 `0.0.0.0:8787` -> 容器 `8787`
+- SOCKS5：宿主机 `127.0.0.1:7928` -> 容器 `7928`
+
+可通过 `.env` 调整 Compose 变量，示例见 `.env.example`。这些变量只在首次生成 `/data/config.json` 时生效；配置已存在后，请通过 Web 管理端或直接修改配置文件调整。
+
+常用命令：
+
+```bash
+docker compose ps
+docker compose logs -f akiragate
+docker compose restart akiragate
+docker compose down
+```
+
 ## 功能
 
 - 不创建 Linux `tun0`，OpenVPN 包由 Go 用户态后端处理。

@@ -16,11 +16,16 @@ akiragate_*
 
 # ---- 运行时数据 ----
 .dev/
+akiragate_data/
+docker-data/
 vpngate_data/
 logs/
 *.log
 *.tmp
 *.pid
+
+# ---- 本地容器环境变量 ----
+.env
 
 # ---- IDE 和编辑器 ----
 .vscode/
